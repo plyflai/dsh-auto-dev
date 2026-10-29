@@ -1,0 +1,8 @@
+node_modules/
+.DS_Store
+*.log
+*.tgz
+tmp/
+# 跑台输出
+design/
+.dsh-flow/

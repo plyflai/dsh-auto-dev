@@ -1,0 +1,58 @@
+{
+  "name": "dsh-auto-dev",
+  "version": "0.1.0",
+  "description": "Auto Dev: read-only intent or delivery with optional plans, machine-filled ledger, evidence-bound claims and a PM board for DeepSeek Harness",
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "plugin",
+    "auto-dev"
+  ],
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "skills",
+    "tools",
+    "lib",
+    "cordis.patch.yml",
+    "BEYOND.md",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-api-session-controller",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "build:client": "node scripts/build-client.mjs",
+    "flow": "node tools/flow.mjs",
+    "check": "node --test tests/*.test.mjs && node tools/scenarios.mjs",
+    "hooks:install": "node tools/install-hooks.mjs",
+    "bench": "node tools/scenarios.mjs",
+    "perf": "node tools/perf.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

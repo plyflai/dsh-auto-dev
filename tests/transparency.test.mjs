@@ -7,7 +7,8 @@ const result = (callId, text) => ({ type: 'tool/result', data: { message: { tool
 
 test('T3: the pulse names the unit in flight, since when, and how its check went', () => {
   let state = foldBoard(null, call(1, 'work_start', { mode: 'do', goal: 'g', plan: [{ id: 'a', goal: 'A', state: 'active' }] }, 'c1'))
-  state = foldBoard(state, result('c1', JSON.stringify({ taskId: 't' })))
+  // The pulse counts the project's own check, matched exactly (the verifier work_start compiled).
+  state = foldBoard(state, result('c1', JSON.stringify({ taskId: 't', compiled: { verifier: { command: 'npm test' } } })))
   state = foldBoard(state, call(2, 'work_plan', { operation: 'activate', unit: 'a' }, 'c1b'))
   state = foldBoard(state, result('c1b', JSON.stringify({ ok: true })))
   state = foldBoard(state, call(2, 'bash', { command: 'npm test' }, 'c2'))

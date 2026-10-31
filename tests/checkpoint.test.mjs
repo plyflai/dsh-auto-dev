@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { captureCheckpoint, listCheckpoints, restoreCheckpoint } from '../src/checkpoint.mjs'
+import { captureCheckpoint, listCheckpoints, restoreCheckpoint, retireCheckpoints } from '../src/checkpoint.mjs'
 
 // Keep leading whitespace: porcelain status uses it to mean "unstaged".
 const git = (cwd, ...args) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).replace(/\n+$/, '')
@@ -30,7 +30,7 @@ test('a checkpoint names the working tree without moving HEAD, the branch or the
 
   const checkpoint = await captureCheckpoint(dir, { slug: 'task-abc', tag: 'before', seq: 1 })
   assert.equal(checkpoint.ok, true)
-  assert.equal(checkpoint.ref, 'refs/auto-dev-v3/task-abc/1-before')
+  assert.equal(checkpoint.ref, 'refs/dsh-auto-dev/task-abc/1-before')
   assert.match(checkpoint.commit, /^[0-9a-f]{40}$/)
 
   assert.equal(git(dir, 'rev-parse', 'HEAD'), headBefore)
@@ -99,4 +99,23 @@ test('a refused git call says why, and never reports an empty reason', async () 
   assert.equal(result.ok, false)
   assert.equal(result.skipped, 'not a git repository')
   assert.equal(result.skipped.endsWith(': '), false)
+})
+
+test('saves of all but the newest three tasks retire; the current task is always kept', async () => {
+  const dir = repo()
+  const saved = process.env.GIT_COMMITTER_DATE
+  try {
+    for (const [index, slug] of ['t1', 't2', 't3', 't4', 't5'].entries()) {
+      process.env.GIT_COMMITTER_DATE = `2026-01-0${index + 1}T00:00:00Z`
+      writeFileSync(path.join(dir, 'a.txt'), `${slug}\n`)
+      await captureCheckpoint(dir, { slug, tag: 'before', seq: 1 })
+    }
+  } finally {
+    if (saved === undefined) delete process.env.GIT_COMMITTER_DATE
+    else process.env.GIT_COMMITTER_DATE = saved
+  }
+  const removed = await retireCheckpoints(dir, { current: 't1' })
+  assert.deepEqual(removed.sort(), ['refs/dsh-auto-dev/t2/1-before', 'refs/dsh-auto-dev/t3/1-before'])
+  const left = git(dir, 'for-each-ref', '--format=%(refname)', 'refs/dsh-auto-dev/').split('\n').sort()
+  assert.deepEqual(left, ['refs/dsh-auto-dev/t1/1-before', 'refs/dsh-auto-dev/t4/1-before', 'refs/dsh-auto-dev/t5/1-before'])
 })

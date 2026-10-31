@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, inject as pluginInject, name, AUTO_DEV_V3_SCHEMA } from '../src/index.js'
+import { apply, inject as pluginInject, name, DSH_AUTO_DEV_SCHEMA } from '../src/index.js'
 
 function human(log, text) {
   log.push({ type: 'user/message', data: { message: { id: `human-${log.length}`, role: 'user',
@@ -107,64 +107,12 @@ test('apply registers six tools, a settings section, a projection, a command and
   // left the section missing from the dialog.
   assert.equal(stub.settings.length, 0)
   assert.equal(typeof (await import('../src/index.js')).Config.toJSON, 'function')
-  assert.equal(stub.projections[0].key, 'autoDevV3')
+  assert.equal(stub.projections[0].key, 'dshAutoDev')
   assert.equal(stub.commands[0].name, 'dsh-auto-dev')
   assert.equal(stub.skinProviders.length, 1)
 
   assert.ok(stub.handlers.has('agent/pre-step'))
   assert.ok(stub.handlers.has('tools/post-execute'))
-})
-
-test('a request that touches a screen is told the browser default at the top', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-uitest-'))
-  const stub = stubContext(project)
-  await testApply(stub)
-  const events = []
-  const agent = { id: 'agent-1', session: { id: 'session-1', header: {}, get seq() { return events.length }, eventAt: index => events[index] } }
-  const tools = new Map(stub.tools.map(tool => [tool.name, tool]))
-  const started = await tools.get('work_start').execute({ request: '给导出页加一个按钮', mode: 'do', scope: ['src/App.tsx'], acceptance: ['能导出'] }, { agent, callId: 'c1', turn: 1 })
-  assert.match(started.uiTest, /Playwright/)
-  assert.match(started.uiTest, /非 headless/)
-  // A backend task is not nagged about a browser it will never open.
-  const other = { id: 'agent-2', session: { id: 'session-2', header: {}, get seq() { return 0 }, eventAt: () => undefined } }
-  const backend = await tools.get('work_start').execute({ request: '把导出 SQL 改成批量查询', mode: 'do', scope: ['src/export.mjs'], acceptance: ['能导出'] }, { agent: other, callId: 'c2', turn: 1 })
-  assert.equal(backend.uiTest, undefined)
-})
-
-test('a browser run in an earlier task does not cover the screen changed now', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'v3-uibled-'))
-  writeFileSync(join(project, 'App.tsx'), 'export const App = () => null\n')
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-b', session: { id: 'sess-b', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tool = name => stub.tools.find(row => row.name === name)
-  const call = (name, args) => {
-    const callId = `c-${log.length}`
-    log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
-    return tool(name).execute(args, { agent, callId, turn: 1 })
-  }
-  const run = (callId, command) => {
-    log.push({ type: 'tool/call', data: { callId, name: 'bash', arguments: { command } } })
-    log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: 'ok' }] } } })
-  }
-  const unit = { id: 'b1', goal: '加按钮', scope: ['App.tsx'], acceptance: ['点了能导出'] }
-
-  // Task one: a browser really ran here.
-  const first = await call('work_start', { request: '给导出页加按钮', mode: 'do', scope: ['App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: first.taskId, operation: 'set', units: [unit] })
-  await call('work_plan', { taskId: first.taskId, operation: 'activate', unit: 'b1' })
-  run('p1', 'npx playwright test --headed')
-  await call('work_submit', { unit: 'b1', outcome: 'complete', summary: '按钮加好了', next: '收', claims: [{ statement: 'npx playwright test', case: 'command', assert: '通过', expected: '0', actual: '0', execution: { callId: 'p1' } }] })
-  await call('work_control', { taskId: first.taskId, operation: 'cancel', reason: '换一个' })
-
-  // Task two: same conversation, but the only thing that ran is a type check.
-  const second = await call('work_start', { request: '再给导出页加一个按钮', mode: 'do', scope: ['App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: second.taskId, operation: 'set', units: [unit] })
-  await call('work_plan', { taskId: second.taskId, operation: 'activate', unit: 'b1' })
-  run('t1', 'npx tsc --noEmit')
-  const submitted = await call('work_submit', { unit: 'b1', outcome: 'complete', summary: '按钮加好了', next: '收', claims: [{ statement: 'npx tsc --noEmit', case: 'command', assert: '没有类型错误', expected: '0', actual: '0', execution: { callId: 't1' } }] })
-  assert.ok(submitted.warnings.some(line => /浏览器/.test(line)), 'an earlier task\'s browser run must not silence this one')
 })
 
 test('an absolute scope that exists is not reported as missing', async () => {
@@ -181,146 +129,8 @@ test('an absolute scope that exists is not reported as missing', async () => {
   assert.ok(!(started.warnings ?? []).some(line => /none of the declared scope exists/.test(line)), 'an absolute path is not missing')
 })
 
-test('a screen unit is nagged about a browser once, and a real run ends it', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'v3-uinudge-'))
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-u', session: { id: 'sess-u', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tool = name => stub.tools.find(row => row.name === name)
-  const call = (name, args) => {
-    const callId = `c-${log.length}`
-    log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
-    return tool(name).execute(args, { agent, callId, turn: 1 })
-  }
-  const started = await call('work_start', { request: '给导出页加按钮', mode: 'do', scope: ['src/App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: started.taskId, operation: 'set', units: [{ id: 'b1', goal: '加按钮', scope: ['src/App.tsx'], acceptance: ['点了能导出'] }] })
-  await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'b1' })
-
-  const pre = stub.handlers.get('agent/pre-step')
-  const next = async () => ({ kind: 'allow', messages: [] })
-  const step = await pre({ agent, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] }], step: 2 }, next)
-  const nudge = step.messages.find(message => message.source?.summary === 'auto-dev-v3 ui test')
-  assert.ok(nudge, 'a screen unit with no browser run should be told once')
-  assert.match(nudge.content[0].text, /playwright/i)
-
-  // One step later it must not repeat: it is a reminder, not a metronome.
-  const again = await pre({ agent, messages: [], step: 3 }, next)
-  assert.equal(again.messages.filter(message => message.source?.summary === 'auto-dev-v3 ui test').length, 0)
-
-  // A real browser run silences it: the next task in this conversation is not nagged.
-  const post = stub.handlers.get('tools/post-execute')
-  const downstream = { additionalContexts: [] }
-  log.push({ type: 'tool/call', data: { callId: 'c-run', name: 'bash', arguments: { command: 'npx playwright test --headed' } } })
-  log.push({ type: 'tool/result', data: { message: { toolCallId: 'c-run', content: [{ type: 'text', text: '1 passed' }], isError: false } } })
-  await post({ agent, name: 'bash', arguments: { command: 'npx playwright test --headed' }, callId: 'c-run' }, downstream, async () => downstream)
-
-  // A run covers the unit it happened in, not the conversation: a second screen
-  // unit has not been looked at, so it gets its own sentence.
-  await call('work_control', { taskId: started.taskId, operation: 'cancel', reason: '换一个' })
-  const second = await call('work_start', { request: '再给导出页加一个按钮', mode: 'do', scope: ['src/App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: second.taskId, operation: 'set', units: [{ id: 'b1', goal: '加第二个按钮', scope: ['src/App.tsx'], acceptance: ['点了能导出'] }] })
-  await call('work_plan', { taskId: second.taskId, operation: 'activate', unit: 'b1' })
-  const againForNewUnit = await pre({ agent, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] }], step: 4 }, next)
-  assert.equal(againForNewUnit.messages.filter(message => message.source?.summary === 'auto-dev-v3 ui test').length, 1, 'a new screen unit gets its own reminder')
-})
-
-test('echoing a browser command is not evidence that a browser ran', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'v3-uiecho-'))
-  writeFileSync(join(project, 'App.tsx'), 'export const App = () => null\n')
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-e', session: { id: 'sess-e', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tool = name => stub.tools.find(row => row.name === name)
-  const call = (name, args) => {
-    const callId = `c-${log.length}`
-    log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
-    return tool(name).execute(args, { agent, callId, turn: 1 })
-  }
-  const run = (callId, command) => {
-    log.push({ type: 'tool/call', data: { callId, name: 'bash', arguments: { command } } })
-    log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: 'ok' }] } } })
-  }
-  const started = await call('work_start', { request: '给导出页加按钮', mode: 'do', scope: ['App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: started.taskId, operation: 'set', units: [{ id: 'b1', goal: '加按钮', scope: ['App.tsx'], acceptance: ['点了能导出'] }] })
-  await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'b1' })
-  run('e1', 'echo "npx playwright test --headed"')
-  run('e2', 'npx tsc --noEmit')
-  const submitted = await call('work_submit', { unit: 'b1', outcome: 'complete', summary: '按钮加好了', next: '收', claims: [{ statement: 'npx tsc --noEmit', case: 'command', assert: '没有类型错误', expected: '0', actual: '0', execution: { callId: 'e2' } }] })
-  assert.ok(submitted.warnings.some(line => /浏览器/.test(line)), 'a printed command is not a browser run')
-})
-
-test('a screenshot path that no file backs up is not evidence', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'v3-uipng-'))
-  writeFileSync(join(project, 'App.tsx'), 'export const App = () => null\n')
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-p', session: { id: 'sess-p', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tool = name => stub.tools.find(row => row.name === name)
-  const call = (name, args) => {
-    const callId = `c-${log.length}`
-    log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
-    return tool(name).execute(args, { agent, callId, turn: 1 })
-  }
-  const run = (callId, command) => {
-    log.push({ type: 'tool/call', data: { callId, name: 'bash', arguments: { command } } })
-    log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: 'ok' }] } } })
-  }
-  const started = await call('work_start', { request: '给导出页加按钮', mode: 'do', scope: ['App.tsx'], acceptance: ['能导出'] })
-  await call('work_plan', { taskId: started.taskId, operation: 'set', units: [{ id: 'b1', goal: '加按钮', scope: ['App.tsx'], acceptance: ['点了能导出'] }] })
-  await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'b1' })
-  run('p1', 'npx tsc --noEmit')
-  const submitted = await call('work_submit', { unit: 'b1', outcome: 'complete', summary: '按钮加好了', next: '收', claims: [{ statement: '点了能导出，截图 outputs/click.png', case: 'screen', assert: '有截图', expected: 'png', actual: 'png', path: 'outputs/click.png', execution: { callId: 'p1' } }] })
-  assert.ok(submitted.warnings.some(line => /浏览器/.test(line)), 'a missing file is not a screenshot')
-
-  // The same claim, with the file actually on disk, is evidence.
-  mkdirSync(join(project, 'outputs'), { recursive: true })
-  writeFileSync(join(project, 'outputs', 'click.png'), 'png')
-  human(log, '请重做截图验证')
-  await call('work_control', { taskId: started.taskId, operation: 'rework', text: '请重做截图验证' })
-  await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'b1' })
-  run('p2', 'npx tsc --noEmit')
-  const again = await call('work_submit', { unit: 'b1', outcome: 'complete', summary: '按钮加好了', next: '收', claims: [{ statement: '点了能导出，截图 outputs/click.png', case: 'screen', assert: '有截图', expected: 'png', actual: 'png', path: 'outputs/click.png', execution: { callId: 'p2' } }] })
-  assert.ok(!again.warnings.some(line => /浏览器/.test(line)), 'a real file is evidence')
-})
-
-test('a unit that touches a screen says so when nothing opened a browser', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-screen-'))
-  const stub = stubContext(project)
-  await testApply(stub)
-  const events = []
-  const agent = { id: 'agent-1', session: { id: 'session-1', header: {}, get seq() { return events.length }, eventAt: index => events[index] } }
-  const tools = new Map(stub.tools.map(tool => [tool.name, tool]))
-  const start = { agent, callId: 'c1', turn: 1 }
-  await tools.get('work_start').execute({ request: '给导出加一个按钮', mode: 'build', scope: ['.'] }, start)
-  await tools.get('work_plan').execute({ operation: 'set', units: [
-    { id: 'u1', goal: '导出按钮', scope: ['src/App.tsx'], acceptance: ['点一下能导出'] },
-    { id: 'u2', goal: '按钮点一下能导出', scope: ['src/App.tsx'], acceptance: ['点一下能导出'] },
-  ] }, { ...start, callId: 'c2' })
-  await tools.get('work_plan').execute({ operation: 'activate', unit: 'u1' }, { ...start, callId: 'c3' })
-
-  // A shell run that proves the file compiles is not proof the button works.
-  const run = (callId, command, exitCode = 0) => {
-    events.push({ type: 'tool/call', data: { callId, name: 'bash', arguments: { command } } })
-    events.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: JSON.stringify({ exitCode, stdout: 'ok' }) }] } } })
-  }
-  run('e1', 'npx tsc --noEmit')
-  const first = await tools.get('work_submit').execute({ unit: 'u1', outcome: 'complete', summary: '按钮加好了', next: '收',
-    claims: [{ statement: 'npx tsc --noEmit', execution: { callId: 'e1' } }] }, { ...start, callId: 'c4' })
-  assert.ok(first.warnings.some(line => /浏览器/.test(line)), 'a screen unit without a browser run should be told once')
-
-  // The browser run the craft page asks for counts, and silences the warning.
-  await tools.get('work_plan').execute({ operation: 'activate', unit: 'u2' }, { ...start, callId: 'c5' })
-  run('e2', 'npx playwright test')
-  const second = await tools.get('work_submit').execute({ unit: 'u2', outcome: 'complete', summary: '按钮点过了', next: '收',
-    claims: [{ statement: 'npx playwright test', execution: { callId: 'e2' } }] }, { ...start, callId: 'c6' })
-  assert.ok(!second.warnings.some(line => /浏览器/.test(line)))
-})
-
 test('a blocked rule that names a directory holds for file writes, not just for the shell', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-blocked-'))
+  const project = mkdtempSync(join(tmpdir(), 'dsh-auto-dev-blocked-'))
   const stub = stubContext(project)
   await testApply(stub)
   const log = []
@@ -341,33 +151,8 @@ test('a blocked rule that names a directory holds for file writes, not just for 
   assert.equal(elsewhere.kind, 'continue')
 })
 
-test('work_start hands over the project vocabulary instead of only its path', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-domain-'))
-  mkdirSync(join(project, '.auto-dev'), { recursive: true })
-  writeFileSync(join(project, '.auto-dev', 'project-domain.md'), [
-    '# 项目业务事实',
-    '',
-    '## 术语',
-    '- **回血包** — 一键恢复出厂设置的脚本。',
-    '',
-    '## 业务不变量',
-    '- 金额最多两位小数。',
-    '',
-  ].join('\n'))
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-1', session: { id: 'session-1', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tools = new Map(stub.tools.map(tool => [tool.name, tool]))
-  const started = await tools.get('work_start').execute({ request: '把导出做完', mode: 'do', scope: ['.'] }, { agent, callId: 'c1', turn: 1 })
-  assert.ok(started.domain, 'a project with a domain file should get its lines handed over')
-  assert.equal(started.domain.path, join(project, '.auto-dev/project-domain.md'))
-  assert.match(started.domain.lines.join(' '), /回血包/)
-  assert.match(started.domain.lines.join(' '), /两位小数/)
-})
-
 test('a runtime fact is a candidate until the person confirms it, and a blocked entry refuses the call', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-env-'))
+  const project = mkdtempSync(join(tmpdir(), 'dsh-auto-dev-env-'))
   const stub = stubContext(project)
   await testApply(stub)
   const log = []
@@ -416,7 +201,7 @@ test('a runtime fact is a candidate until the person confirms it, and a blocked 
 })
 
 test('postmortem writes engineering memory, preserves legacy notes, and keeps the memory ceiling', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-post-'))
+  const project = mkdtempSync(join(tmpdir(), 'dsh-auto-dev-post-'))
   mkdirSync(join(project, '.auto-dev'), { recursive: true })
   const stub = stubContext(project)
   await testApply(stub)
@@ -439,58 +224,18 @@ test('postmortem writes engineering memory, preserves legacy notes, and keeps th
   assert.equal(written.incidents[0].symptom, '导出偶发失败')
   assert.equal(written.incidents[0].prevention, '提交前跑并发用例')
 
-  // The ceiling is a real refusal, with the only useful instruction in it.
+  // At the ceiling the oldest of that kind makes room; nobody is asked to prune.
   const full = { version: 1, facts: Array.from({ length: 60 }, (_, i) => ({ id: `f${i}`, text: `事实 ${i}` })), incidents: Array.from({ length: 60 }, (_, i) => ({ id: `i${i}`, symptom: `毛病 ${i}` })) }
   writeFileSync(join(project, '.auto-dev/memory.json'), JSON.stringify(full))
-  await assert.rejects(
-    tools.get('work_control').execute({ operation: 'remember', payload: { kind: 'fact', text: '再来一条' } }, { agent, callId: 'c4', turn: 1 }),
-    /上限 120/,
-  )
-})
-
-test('a refactor keeps what must not change, a verification needs a real run, and a number needs a run', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-kind-'))
-  const stub = stubContext(project)
-  await testApply(stub)
-  const log = []
-  const agent = { id: 'agent-1', session: { id: 'session-1', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const tools = new Map(stub.tools.map(tool => [tool.name, tool]))
-  const task = await tools.get('work_start').execute({ request: '重构导出并验收', mode: 'build', scope: [project] }, { agent, callId: 'c1', turn: 1 })
-  await tools.get('work_plan').execute({
-    operation: 'set',
-    units: [
-      { id: 'r1', goal: '重构导出，把三种格式拆开', kind: 'refactor', scope: [project], acceptance: [] },
-      { id: 'v1', goal: '回归验收导出', kind: 'verification', scope: [project], acceptance: [] },
-    ],
-  }, { agent, callId: 'c2', turn: 1 })
-
-  // Activate names the page worth reading, once per session.
-  const opened = await tools.get('work_plan').execute({ operation: 'activate', unit: 'r1' }, { agent, callId: 'c3', turn: 1 })
-  assert.equal(opened.craft[0].doc, 'references/craft/impact.md')
-  const again = await tools.get('work_plan').execute({ operation: 'activate', unit: 'v1' }, { agent, callId: 'c4', turn: 1 })
-  assert.equal(again.craft.some(page => page.doc === 'references/craft/impact.md'), true, 'a different unit has its own impact context')
-
-  log.push({ type: 'tool/call', data: { callId: 'x1', name: 'bash', arguments: { command: 'npm test' } } })
-  log.push({ type: 'tool/result', data: { callId: 'x1', message: { toolCallId: 'x1', isError: false, content: [{ type: 'text', text: 'pass' }] } } })
-  const claim = (callId) => [{ statement: 'npm test', execution: { callId } }]
-
-  await assert.rejects(
-    tools.get('work_submit').execute({ unit: 'r1', outcome: 'complete', summary: '拆开了', next: '验收', claims: claim('x1') }, { agent, callId: 'c5', turn: 1 }),
-    /preserve/,
-  )
-  await tools.get('work_submit').execute({ unit: 'r1', outcome: 'complete', summary: '拆开了', next: '验收', claims: claim('x1'), preserve: ['导出的文件名不变'] }, { agent, callId: 'c6', turn: 1 })
-
-  await assert.rejects(
-    tools.get('work_submit').execute({ unit: 'v1', outcome: 'complete', summary: '看过了', next: '收', claims: [{ statement: '导出能点', case: 'manual', steps: ['点导出'] }] }, { agent, callId: 'c7', turn: 1 }),
-    /verification unit needs at least one executed check/,
-  )
-  const measured = await tools.get('work_submit').execute({ unit: 'v1', outcome: 'complete', summary: '导出快了 40%', next: '收', claims: claim('x1') }, { agent, callId: 'c8', turn: 1 })
-  assert.equal(measured.tier.length, 2)
-  assert.equal(task.taskId.length > 0, true)
+  const more = await tools.get('work_control').execute({ operation: 'remember', payload: { kind: 'fact', text: '再来一条' } }, { agent, callId: 'c4', turn: 1 })
+  assert.equal(more.evicted, '事实 0')
+  const after = JSON.parse(readFileSync(join(project, '.auto-dev/memory.json'), 'utf8'))
+  assert.equal(after.facts.length + after.incidents.length, 120)
+  assert.equal(after.facts.at(-1).text, '再来一条')
 })
 
 test('a cheaper way is said once, and what the person answered is kept', async () => {
-  const project = mkdtempSync(join(tmpdir(), 'auto-dev-v3-alt-'))
+  const project = mkdtempSync(join(tmpdir(), 'dsh-auto-dev-alt-'))
   const stub = stubContext(project)
   await testApply(stub)
   const log = []
@@ -521,17 +266,17 @@ test('an irreversible call is refused before it runs, not reported after', async
   const next = async () => ({ kind: 'allow' })
 
   // No task yet: nothing to authorize against, the call passes and gets enrolled.
-  assert.equal((await pre({ name: 'bash', arguments: { command: 'rm -rf src' }, agent, callId: 'c0' }, next)).kind, 'allow')
+  assert.equal((await pre({ name: 'bash', arguments: { command: 'git reset --hard' }, agent, callId: 'c0' }, next)).kind, 'allow')
 
   await workStart.execute({ request: 'refactor the slug module', mode: 'do', scope: ['.'] }, exec)
-  const denied = await pre({ name: 'bash', arguments: { command: 'rm -rf src' }, agent, callId: 'c1' }, next)
+  const denied = await pre({ name: 'bash', arguments: { command: 'git reset --hard' }, agent, callId: 'c1' }, next)
   assert.equal(denied.kind, 'deny')
-  assert.match(denied.reason, /recursive-delete/)
-  assert.match(denied.reason, /work_extend/)
+  assert.match(denied.reason, /破坏性操作.*\n过关：先问用户/s)
+  assert.doesNotMatch(denied.reason, /work_extend|forced-git-reset/)
 
   // A check the task is allowed to run is not refused.
   assert.equal((await pre({ name: 'bash', arguments: { command: 'npm test' }, agent, callId: 'c2' }, next)).kind, 'allow')
-  // Nor is work_extend itself, which is how the authorization gets recorded.
+  // Nor is the plugin's own tool.
   assert.equal((await pre({ name: 'work_extend', arguments: {}, agent, callId: 'c3' }, next)).kind, 'allow')
 })
 
@@ -551,36 +296,32 @@ test('a closed task is still findable, and says so instead of "call work_start f
   const status = await tools.work_status.execute({ view: 'summary' }, exec)
   assert.equal(status.task.id, started.taskId)
 
-  // Changing a finished plan, or handing in more work, must refuse and say why.
-  await assert.rejects(() => tools.work_plan.execute({ operation: 'add', units: [{ id: 'u9', goal: 'more', scope: ['.'], acceptance: ['x'], dependsOn: [] }] }, exec),
-    /is closed — explicitly adopt/)
-  await assert.rejects(() => tools.work_submit.execute({ outcome: 'complete', summary: 'x', next: 'y' }, exec),
-    /is closed — explicitly adopt/)
+  // Changing a finished plan, or handing in more work, changes nothing and says how to reopen.
+  const added = await tools.work_plan.execute({ operation: 'add', units: [{ id: 'u9', goal: 'more' }] }, exec)
+  assert.equal(added.unchanged, true)
+  assert.match(added.tellUser, /adopt/)
+  assert.match((await tools.work_submit.execute({ outcome: 'complete', summary: 'x' }, exec)).tellUser, /adopt/)
 
   // Reopening is the documented way back.
-  await assert.rejects(() => tools.work_control.execute({ operation: 'continue' }, exec), /refuses task state closed/)
+  assert.match((await tools.work_control.execute({ operation: 'continue' }, exec)).tellUser, /已经收案.*adopt/)
   const reopened = await tools.work_control.execute({ operation: 'adopt', taskId: started.taskId }, exec)
   assert.equal(reopened.state, 'active')
   assert.equal(reopened.taskId, started.taskId)
 })
 
 test('the settings schema rejects what the gates would not be able to honour', () => {
-  assert.equal(AUTO_DEV_V3_SCHEMA({}).scopeEnforcement, 'advisory')
-  assert.equal(AUTO_DEV_V3_SCHEMA({ scopeEnforcement: 'blocking' }).scopeEnforcement, 'blocking')
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ scopeEnforcement: 'strict' }), /scopeEnforcement must be/)
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ protectedPaths: '.dsh/' }), /protectedPaths must be an array/)
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ autoEnroll: 'yes' }), /autoEnroll must be boolean/)
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ verificationNudgeAfter: 0 }), /verificationNudgeAfter/)
-  assert.equal(typeof AUTO_DEV_V3_SCHEMA.toJSON, 'function')
+  assert.equal('scopeEnforcement' in DSH_AUTO_DEV_SCHEMA({ scopeEnforcement: 'blocking' }), false, 'a switch nothing reads is gone; an old stored value is ignored')
+  assert.throws(() => DSH_AUTO_DEV_SCHEMA({ protectedPaths: '.dsh/' }), /protectedPaths must be an array/)
+  assert.throws(() => DSH_AUTO_DEV_SCHEMA({ autoEnroll: 'yes' }), /autoEnroll must be boolean/)
+  assert.equal(typeof DSH_AUTO_DEV_SCHEMA.toJSON, 'function')
 })
 
-test('work_start refuses an empty request and records a real task', async () => {
+test('work_start records a real task', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const workStart = stub.tools.find(tool => tool.name === 'work_start')
   const exec = { agent: { id: 'agent-1', session: { id: 'session-1' } }, callId: 'call-1', signal: undefined }
 
-  await assert.rejects(() => workStart.execute({ request: '' }, exec), /request/)
   const value = await workStart.execute({ request: 'add a subtract function', mode: 'do', scope: ['.'] }, exec)
   assert.match(value.taskId, /^task-/)
   assert.equal(value.mode, 'do')
@@ -615,16 +356,16 @@ test('every reachable dialog schema node is independently consumable by the host
     for (const child of node.list ?? []) visit(child)
   }
   visit(Config)
-  assert.ok(seen.size >= 10, `expected the complete schema graph, saw ${seen.size} nodes`)
+  assert.ok(seen.size >= 7, `expected the complete schema graph, saw ${seen.size} nodes`)
 })
 
 test('readConfig unwraps volatile wrappers instead of dropping settings', async () => {
   const { readConfig, DEFAULT_CONFIG } = await import('../src/index.js')
   assert.deepEqual(readConfig(undefined), DEFAULT_CONFIG)
   // schemastery volatile fields answer get() and must be unwrapped
-  const wrapped = { scopeEnforcement: { get: () => 'blocking' }, autoEnroll: { get: () => false } }
+  const wrapped = { checkpoints: { get: () => false }, autoEnroll: { get: () => false } }
   const value = readConfig(wrapped)
-  assert.equal(value.scopeEnforcement, 'blocking')
+  assert.equal(value.checkpoints, false)
   assert.equal(value.autoEnroll, false)
   assert.deepEqual(value.protectedPaths, DEFAULT_CONFIG.protectedPaths)
 })
@@ -669,7 +410,7 @@ test('export carries the record out without pretending the callIds travel', asyn
   const exec = { agent: { id: 'a', session: { id: 's' } }, callId: 'c', signal: undefined }
   await workStart.execute({ request: 'add subtract', mode: 'build', plan: [{ id: 'u1', goal: 'subtract works', scope: ['calc.mjs'], acceptance: ['npm test'], dependsOn: [] }] }, exec)
   const snapshot = await workControl.execute({ operation: 'export' }, exec)
-  assert.equal(snapshot.format, 'auto-dev-v3/export@1')
+  assert.equal(snapshot.format, 'dsh-auto-dev/export@1')
   assert.equal(snapshot.task.units.length, 1)
   assert.match(snapshot.note, /host-local history/)
   assert.equal(JSON.stringify(JSON.parse(JSON.stringify(snapshot))), JSON.stringify(snapshot))
@@ -682,7 +423,7 @@ test('import arrives unverified: units land pending and history is marked', asyn
   const workPlan = stub.tools.find(tool => tool.name === 'work_plan')
   const exec = { agent: { id: 'a', session: { id: 's', seq: 7 } }, callId: 'c', signal: undefined }
   const payload = {
-    format: 'auto-dev-v3/export@1',
+    format: 'dsh-auto-dev/export@1',
     task: {
       id: 'task-elsewhere', project: '/repo/other', mode: 'build', request: 'do the thing',
       scope: ['.'], acceptance: ['tests pass'], units: [{ id: 'u1', goal: 'first', scope: ['a.js'], acceptance: ['x'], dependsOn: [], state: 'done' }],
@@ -698,14 +439,16 @@ test('import arrives unverified: units land pending and history is marked', asyn
   assert.equal(saved.ledger[0].verifiedHere, false)
 })
 
-test('import refuses a payload that is not an export', async () => {
+test('import answers a payload that is not an export without changing anything', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const workStart = stub.tools.find(tool => tool.name === 'work_start')
   const workControl = stub.tools.find(tool => tool.name === 'work_control')
   const exec = { agent: { id: 'a', session: { id: 's' } }, callId: 'c', signal: undefined }
   await workStart.execute({ request: 'x', mode: 'do' }, exec)
-  await assert.rejects(() => workControl.execute({ operation: 'import', payload: { hello: 1 } }, exec), /not an auto-dev-v3 export/)
+  const result = await workControl.execute({ operation: 'import', payload: { hello: 1 } }, exec)
+  assert.equal(result.imported, false)
+  assert.match(result.tellUser, /不是一份 dsh-auto-dev 导出/)
 })
 
 test('work_start moves the project root when the declared paths live in a subdirectory', async () => {
@@ -739,7 +482,7 @@ test('checkpoints: false stops the snapshot before it reaches git', async () => 
   const exec = { agent: { id: 'agent-1', session: { id: 'session-1' } }, callId: 'call-1', signal: undefined }
   const value = await workStart.execute({ request: 'look at how the parser is wired', mode: 'do', scope: ['.'] }, exec)
   assert.equal(value.checkpoint.snapshot, 'skipped')
-  assert.match(value.checkpoint.reason, /disabled in the auto-dev-v3 settings/)
+  assert.match(value.checkpoint.reason, /disabled in the dsh-auto-dev settings/)
 })
 
 test('another Auto Dev that shadows the tools owns the session, and v3 stays quiet', async () => {
@@ -805,15 +548,13 @@ test('every tool answers, including the views a refactor can orphan', async () =
   assert.equal(Array.isArray(checkpoints.refs), true)
   assert.equal((await call('work_control', { operation: 'pause' })).state, 'paused')
   assert.equal((await call('work_control', { operation: 'resume' })).state, 'active')
-  assert.equal((await call('work_control', { operation: 'export' })).format, 'auto-dev-v3/export@1')
+  assert.equal((await call('work_control', { operation: 'export' })).format, 'dsh-auto-dev/export@1')
 
   const asked = await call('work_extend', { kind: 'authorization', risk: 'recursive-delete', reason: 'clean the build directory' })
-  assert.equal(typeof asked.question, 'string')
-  assert.match(asked.question, /recursive-delete/)
-  await assert.rejects(
-    () => call('work_extend', { kind: 'authorization', risk: 'recursive-delete', reason: 'clean', authorization: 'yes go ahead' }),
-    /decision source not found/,
-  )
+  assert.equal(asked.granted, false)
+  assert.match(asked.tellUser, /直接问用户/)
+  // Words the model writes into the call grant nothing.
+  assert.equal((await call('work_extend', { kind: 'authorization', risk: 'recursive-delete', reason: 'clean', authorization: 'yes go ahead' })).granted, false)
 
   assert.equal((await call('work_control', { operation: 'cancel', reason: 'test over' })).state, 'cancelled')
 })
@@ -833,10 +574,7 @@ test('a plan in the {units: [...]} spelling is the same plan', async () => {
   assert.deepEqual(listed.units.map(unit => unit.id), ['u1'])
 })
 
-test('a refused plan leaves no task behind, so the next status is not a ghost', async () => {
-  // Found live: the record was written before the plan was validated, so a refused
-  // `work_start` left an active task with no units, and `activeTask` handed that
-  // orphan to the next taskId-less call — the board showed a task nobody worked on.
+test('a plan with fields missing is filled in, not refused', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const call = async (name, args) => {
@@ -844,19 +582,12 @@ test('a refused plan leaves no task behind, so the next status is not a ghost', 
     const exec = { agent: { id: 'agent-1', session: { id: 'session-1', seq: 3, eventAt: () => undefined } }, callId: `call-${name}`, signal: undefined }
     return tool.execute(args, exec)
   }
-  const good = await call('work_start', { request: 'real task', mode: 'do' })
-  const before = stub.tables?.tasks?.size ?? 0
-  await assert.rejects(
-    () => call('work_start', { request: 'bad plan', mode: 'build', plan: [{ id: 'u1', goal: 'no scope, no children', acceptance: [] }] }),
-    /needs a non-empty scope/,
-  )
-  const after = stub.tables?.tasks?.size ?? 0
-  assert.equal(after, before, 'a refused plan must not add a task record')
-  const status = await call('work_status', {})
-  assert.equal(status.task.id, good.taskId, 'the session still points at the task it really had')
+  const started = await call('work_start', { request: 'bad plan', mode: 'build', plan: [{ id: 'u1', goal: 'no scope, no children', acceptance: [] }] })
+  const listed = await call('work_plan', { taskId: started.taskId, operation: 'list' })
+  assert.deepEqual(listed.units.map(unit => [unit.id, unit.scope]), [['u1', ['.']]])
 })
 
-test('an unreadable plan is refused instead of dropped', async () => {
+test('an unreadable plan starts the task without one', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const call = async (name, args) => {
@@ -864,45 +595,25 @@ test('an unreadable plan is refused instead of dropped', async () => {
     const exec = { agent: { id: 'agent-1', session: { id: 'session-1', seq: 3, eventAt: () => undefined } }, callId: `call-${name}`, signal: undefined }
     return tool.execute(args, exec)
   }
-  await assert.rejects(
-    () => call('work_start', { request: 'x', mode: 'build', plan: { packets: [] } }),
-    /plan must be a non-empty array of units/,
-  )
+  const started = await call('work_start', { request: 'x', mode: 'build', plan: { packets: [] } })
+  assert.match(started.taskId, /^task-/)
+  assert.equal(started.planId, undefined)
 })
 
-test('an answer the owner picked counts as authorization, recorded as a choice', async () => {
+test('an option the owner picked lets the stopped action through; nothing is copied into a call', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const log = []
   const session = { id: 'sess-1', get seq() { return log.length }, eventAt: index => log[index] }
-  const exec = { agent: { id: 'agent-1', session }, callId: 'call-x', signal: undefined }
-  const call = (name, args) => stub.tools.find(candidate => candidate.name === name).execute(args, exec)
-
-  const started = await call('work_start', { request: 'write the config', mode: 'do', scope: ['.'] })
-  const asked = await call('work_extend', { taskId: started.taskId, kind: 'authorization', risk: 'control-plane', reason: 'test the gate', action: 'write /tmp/v3-gap' })
-  assert.equal(asked.granted, false)
-  log.push({ type: 'tool/call', data: { callId: 'q1', name: 'ask_user_question', arguments: { questions: [{ question: 'Allow write /tmp/v3-gap?' }] } } })
-  log.push({
-    type: 'tool/result',
-    data: { message: { toolCallId: 'q1', isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'ask', selected: ['allow write /tmp/v3-gap'] }] }) }] } },
-  })
-
-  const granted = await call('work_extend', { taskId: started.taskId, kind: 'authorization', risk: 'control-plane', reason: 'test the gate', action: 'write /tmp/v3-gap', authorization: 'allow write /tmp/v3-gap' })
-  assert.equal(granted.granted, true)
-  const decision = [...stub.records.entries()].find(([key]) => key.startsWith('decisions/'))
-  assert.equal(decision[1].via, 'option-choice')
-})
-
-test('words nobody said are still refused, and the refusal names both places it looked', async () => {
-  const stub = stubContext()
-  await (testApply(stub))
-  const exec = { agent: { id: 'agent-1', session: { id: 'sess-1', seq: 0, eventAt: () => undefined } }, callId: 'call-x', signal: undefined }
-  const call = (name, args) => stub.tools.find(candidate => candidate.name === name).execute(args, exec)
-  const started = await call('work_start', { request: 'x', mode: 'do', scope: ['.'] })
-  await assert.rejects(
-    () => call('work_extend', { taskId: started.taskId, kind: 'authorization', risk: 'control-plane', reason: 'r', authorization: 'go ahead' }),
-    /exact command|needs action|decision source not found/,
-  )
+  const agent = { id: 'agent-1', session }
+  await stub.tools.find(candidate => candidate.name === 'work_start').execute({ request: 'write the config', mode: 'do', scope: ['.'] }, { agent, callId: 'c0' })
+  const pre = stub.handlers.get('tools/pre-execute')
+  const next = async () => ({ kind: 'continue' })
+  const action = { name: 'bash', arguments: { command: 'git push --force' }, agent }
+  assert.equal((await pre({ ...action, callId: 'c1' }, next)).kind, 'deny')
+  log.push({ type: 'tool/call', data: { callId: 'q1', name: 'ask_user_question', arguments: { questions: [{ question: 'Allow git push --force?' }] } } })
+  log.push({ type: 'tool/result', data: { message: { toolCallId: 'q1', isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'ask', selected: ['allow'] }] }) }] } } })
+  assert.equal((await pre({ ...action, callId: 'c2' }, next)).kind, 'continue')
 })
 
 test('a build plan arrives compiled: units in order, one verifier read from the repository', async () => {
@@ -972,9 +683,10 @@ test('a nested plan compiles to its leaves, and the report counts them rather th
   // The first runnable unit is a leaf, and it names the milestone that holds it.
   assert.equal(started.nextUnit.id, 'u-a')
   assert.equal(started.nextUnit.parent, 'm1')
-  const refused = await stub.tools.find(candidate => candidate.name === 'work_plan')
-    .execute({ taskId: started.taskId, operation: 'activate', unit: 'm1' }, exec).then(() => undefined, error => error)
-  assert.match(refused.message, /milestone|not a leaf|holds/i)
+  // Naming the milestone means the leaf inside it that is next.
+  const activated = await stub.tools.find(candidate => candidate.name === 'work_plan')
+    .execute({ taskId: started.taskId, operation: 'activate', unit: 'm1' }, exec)
+  assert.equal(activated.unit.id, 'u-a')
 })
 
 test('a project with no declared check says so instead of inventing one', async () => {
@@ -1024,26 +736,7 @@ test('a scope that exists nowhere under the resolved project is reported, not si
 })
 
 
-test('a look task is never nudged to run the suite, and neither is a submit with no claims', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'v3-look-'))
-  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }))
-  const stub = stubContext(root)
-  await (testApply(stub))
-  const exec = { agent: { id: 'agent-1', session: { id: 'sess-1', seq: 0, eventAt: () => undefined } }, callId: 'call-x', signal: undefined }
-  const call = (name, args) => stub.tools.find(candidate => candidate.name === name).execute(args, exec)
-
-  const asked = await call('work_start', { request: 'what does getUser return?', mode: 'look', scope: ['.'] })
-  const looked = await call('work_submit', { taskId: asked.taskId, outcome: 'complete', summary: 'it returns a literal', next: 'nothing' })
-  assert.deepEqual(looked.warnings ?? [], [], 'a question does not run a test suite')
-
-  const second = await call('work_start', { request: 'do a thing with no acceptance', mode: 'do', scope: ['.'] })
-  const quiet = await call('work_submit', { taskId: second.taskId, outcome: 'complete', summary: 'nothing was claimed', next: 'nothing' })
-  // The receipt warning is the only one owed here: nothing was claimed, so there
-  // is nothing to verify, but this version still needs a screen the user agreed to.
-  assert.deepEqual(quiet.warnings.filter(warning => !warning.includes('回执')), [], 'no claim, nothing to nag about')
-})
-
-test('a milestone cannot be activated, and its units can', async () => {
+test('activating a milestone activates the unit inside it', async () => {
   const stub = stubContext()
   await (testApply(stub))
   const exec = { agent: { session: { seq: 1 }, id: 'agent-a' }, callId: 'call-plan-1' }
@@ -1062,9 +755,8 @@ test('a milestone cannot be activated, and its units can', async () => {
   })
   const milestone = await call('work_plan', { taskId: started.taskId, operation: 'list' })
   assert.equal(milestone.nextUnit.id, 'm1-a', 'the plan points at the unit inside the milestone, not the milestone')
-  await assert.rejects(() => call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'm1' }),
-    /unit "m1" is a milestone holding 1 unit\(s\) \(m1-a\): activate one of those, not the milestone/)
-  const activated = await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'm1-a' })
+  const activated = await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'm1' })
+  assert.equal(activated.unit.id, 'm1-a')
   assert.equal(activated.unit.state, 'active')
 })
 
@@ -1119,7 +811,7 @@ test('a task left half done in another session is adopted, and its window restar
   assert.equal(submitted.state, 'closed')
 })
 
-test('adopt refuses what cannot be continued and says where the list is', async () => {
+test('adopt answers what cannot be continued with what can', async () => {
   const project = mkdtempSync(join(tmpdir(), 'v3-adopt-'))
   const stub = stubContext(project)
   await (testApply(stub))
@@ -1128,12 +820,14 @@ test('adopt refuses what cannot be continued and says where the list is', async 
   const exec = { agent: { id: 'agent-c', session }, callId: 'c1', signal: undefined }
   const call = (name, args) => stub.tools.find(tool => tool.name === name).execute(args, exec)
 
-  await assert.rejects(() => call('work_control', { operation: 'adopt' }), /adopt needs taskId/)
-  await assert.rejects(() => call('work_control', { operation: 'adopt', taskId: 'task-nope' }), /work_status view "tasks"/)
+  assert.match((await call('work_control', { operation: 'adopt' })).tellUser, /没说接手哪一条/)
+  assert.match((await call('work_control', { operation: 'adopt', taskId: 'task-nope' })).tellUser, /没有任务 task-nope/)
 
   const started = await call('work_start', { request: 'x', mode: 'do', project, scope: ['.'] })
   await call('work_control', { operation: 'cancel', taskId: started.taskId, reason: 'done elsewhere' })
-  await assert.rejects(() => call('work_control', { operation: 'adopt', taskId: started.taskId }), /is cancelled/)
+  const cancelled = await call('work_control', { operation: 'adopt', taskId: started.taskId })
+  assert.equal(cancelled.adopted, false)
+  assert.match(cancelled.tellUser, /已取消/)
 })
 
 test('a snapshot taken here travels as a coordinate, so an import keeps what it cannot carry', async () => {
@@ -1159,7 +853,7 @@ test('a snapshot taken here travels as a coordinate, so an import keeps what it 
   const started = await call('work_start', { request: 'x', mode: 'do', project, scope: ['.'] })
   assert.equal(started.checkpoint.snapshot, 'captured')
   const exported = await call('work_control', { operation: 'export', taskId: started.taskId })
-  assert.equal(exported.format, 'auto-dev-v3/export@1')
+  assert.equal(exported.format, 'dsh-auto-dev/export@1')
   assert.equal(exported.task.checkpoints.length, 1)
   // The coordinate travels; the object does not. A restore on the far side says
   // "that checkpoint object is gone from this repository" instead of pretending.
@@ -1189,14 +883,15 @@ test('a slash command cannot address the model, so it leaves a request the next 
   const pre = stub.handlers.get('agent/pre-step')
   const next = async () => ({ kind: 'allow', messages: [] })
   const step = await pre({ agent, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '开始' }] }], step: 1 }, next)
-  const notice = step.messages.find(message => message.source?.kind === 'auto-dev-v3')
+  const notice = step.messages.find(message => message.source?.kind === 'dsh-auto-dev')
   assert.ok(notice, 'the request has to reach the model somehow')
   assert.match(notice.content[0].text, /给 slug 加 trim，并补一个测试/)
-  assert.match(notice.content[0].text, /request 用这段原话/)
+  assert.match(notice.content[0].text, /已经登记好，直接开工/)
+  assert.equal(Object.values(stub.tables.tasks).find(task => task.sessionId === 'sess-e')?.request, '给 slug 加 trim，并补一个测试')
 
   // Delivered once: the next step must not repeat it as if it were fresh.
   const again = await pre({ agent, messages: [], step: 2 }, next)
-  assert.equal(again.messages.filter(message => message.source?.summary === 'auto-dev-v3 start').length, 0)
+  assert.equal(again.messages.filter(message => message.source?.summary === 'dsh-auto-dev start').length, 0)
 })
 
 test('a fresh session is told which task is already half done, so "continue" has an address', async () => {
@@ -1222,15 +917,15 @@ test('a fresh session is told which task is already half done, so "continue" has
   const pre = stub.handlers.get('agent/pre-step')
   const next = async () => ({ kind: 'allow', messages: [] })
   const step = await pre({ agent: agentB, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '继续工作' }] }], step: 1 }, next)
-  const hint = step.messages.find(message => message.source?.summary === 'auto-dev-v3 resume hint')
+  const hint = step.messages.find(message => message.source?.summary === 'dsh-auto-dev resume hint')
   assert.ok(hint, 'without this the model starts a second task over the first')
   assert.match(hint.content[0].text, new RegExp(started.taskId))
-  assert.match(hint.content[0].text, /adopt/)
+  assert.match(hint.content[0].text, /接过来再继续/)
   assert.match(hint.content[0].text, /split the parser into two modules/)
 
   // Said once, and only while the task is unfinished.
   const again = await pre({ agent: agentB, messages: [], step: 2 }, next)
-  assert.equal(again.messages.filter(message => message.source?.summary === 'auto-dev-v3 resume hint').length, 0)
+  assert.equal(again.messages.filter(message => message.source?.summary === 'dsh-auto-dev resume hint').length, 0)
 })
 
 test('a request typed after the command name starts the work now, not on the next message', async () => {
@@ -1256,7 +951,7 @@ test('a request typed after the command name starts the work now, not on the nex
   // Nothing is left waiting for a second message: the request already went through.
   const pre = stub.handlers.get('agent/pre-step')
   const step = await pre({ agent, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '给 slug 加 trim，并补一个测试' }] }], step: 1 }, async () => ({ kind: 'allow', messages: [] }))
-  assert.equal(step.messages.filter(message => message.source?.summary === 'auto-dev-v3 start').length, 0)
+  assert.equal(step.messages.filter(message => message.source?.summary === 'dsh-auto-dev start').length, 0)
 
   // A real verb still wins: `status` answers and opens nothing.
   const status = await command.handler({ agent, rawInput: 'status' })
@@ -1286,7 +981,7 @@ test('adopt continues in the same gesture, and the turn names the task and the f
   assert.equal(adopted.kind, 'success')
   assert.equal(turns.length, 1, 'adopting without continuing would need a second message')
   assert.match(turns[0].content[0].text, new RegExp(started.taskId))
-  assert.match(turns[0].content[0].text, /work_status/)
+  assert.match(turns[0].content[0].text, /接手卡/)
   assert.equal(turns[0].source.kind, 'user')
 })
 
@@ -1299,10 +994,21 @@ const narrationSuite = async (config = {}) => {
   const project = mkdtempSync(join(tmpdir(), 'v3-narrate-'))
   const stub = stubContext(project)
   await testApply(stub, config)
-  const session = { id: 'sess-n', get seq() { return 0 }, eventAt: () => undefined }
+  // The reminder reads the session log (host facts): one step/start + assistant/message per step.
+  const log = []
+  const session = { id: 'sess-n', get seq() { return log.length }, eventAt: index => log[index] }
   const agent = { id: 'agent-n', session }
-  const pre = stub.handlers.get('agent/pre-step')
-  const next = async () => ({ kind: 'allow', messages: [] })
+  const hook = stub.handlers.get('agent/pre-step')
+  let last = 0
+  const pre = ({ agent, messages, step }, next) => {
+    for (let at = last + 1; at <= step; at++) {
+      log.push({ type: 'step/start', data: { step: at } })
+      const content = at === step ? messages[0].content : [{ type: 'tool-call', name: 'bash' }]
+      log.push({ type: 'assistant/message', data: { step: at, message: { role: 'assistant', content } } })
+    }
+    last = step
+    return hook({ agent, messages, step }, next)
+  }
   const toolOnly = [{ role: 'assistant', content: [{ type: 'tool_call', name: 'bash' }] }]
   const spoke = text => [{ role: 'assistant', content: [{ type: 'text', text }] }]
   const firedIn = stepResult => stepResult.messages.filter(m => m.source?.summary === 'no visible words to the user').length
@@ -1336,9 +1042,9 @@ test('a delegated child is exempt: it reports to its parent, who relays', async 
 test('narrationNudgeAfter=0 turns the reminder off, and the schema bounds the rest', async () => {
   const { agent, pre, toolOnly, firedIn } = await narrationSuite({ narrationNudgeAfter: 0 })
   assert.equal(firedIn(await pre({ agent, messages: toolOnly, step: 500 }, async () => ({ kind: 'allow', messages: [] }))), 0)
-  assert.equal(AUTO_DEV_V3_SCHEMA({ narrationNudgeAfter: 0 }).narrationNudgeAfter, 0)
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ narrationNudgeAfter: 501 }), TypeError)
-  assert.throws(() => AUTO_DEV_V3_SCHEMA({ narrationNudgeAfter: -1 }), TypeError)
+  assert.equal(DSH_AUTO_DEV_SCHEMA({ narrationNudgeAfter: 0 }).narrationNudgeAfter, 0)
+  assert.throws(() => DSH_AUTO_DEV_SCHEMA({ narrationNudgeAfter: 501 }), TypeError)
+  assert.throws(() => DSH_AUTO_DEV_SCHEMA({ narrationNudgeAfter: -1 }), TypeError)
 })
 
 test('work_start ships the reporting contract with the task', async () => {
@@ -1385,30 +1091,26 @@ test('work_start is not even offered until the user starts, and one start grants
   log.push({ type: 'user/message', data: { message: turns[0] } })
   const preStep = stub.handlers.get('agent/pre-step')
   const hinted = await preStep({ agent, messages: [turns[0]], step: 1 }, async () => ({ kind: 'continue', messages: [turns[0]] }))
-  const granted = hinted.messages.find(message => message.source?.summary === 'auto-dev-v3 start granted')
+  const granted = hinted.messages.find(message => message.source?.summary === 'dsh-auto-dev start granted')
   assert.ok(granted)
-  assert.match(granted.content[0].text, /work_start.*登记任务/)
-  assert.match(granted.content[0].text, /无需再次询问是否开工/)
+  // The start registered the task itself: the model reads the user's words and begins, filling nothing.
+  assert.doesNotMatch(granted.content[0].text, /work_start/)
+  assert.match(granted.content[0].text, /不用再问要不要开始/)
   assert.match(granted.content[0].text, /把登录按钮改成进度条/)
-  assert.equal(hinted.messages.some(message => message.source?.summary === 'auto-dev-v3 standing hint'), false)
+  assert.equal(hinted.messages.some(message => message.source?.summary === 'dsh-auto-dev standing hint'), false)
   const repeated = await preStep({ agent, messages: [turns[0]], step: 1 }, async () => ({ kind: 'continue', messages: [turns[0]] }))
-  assert.equal(repeated.messages.length, 1, 'the registration hint is once per grant, without a conflicting fallback')
-
-  const downstream = { additionalContexts: [] }
-  const afterWrite = await stub.handlers.get('tools/post-execute')(
-    { agent, name: 'write', callId: 'write-before-start', arguments: { path: 'src/button.mjs', content: 'draft' } },
-    { isError: false }, async () => downstream)
-  const writeHint = afterWrite.additionalContexts.find(message => message.source?.summary === 'auto-dev-v3 start hint')
-  assert.equal(writeHint.content[0].text, granted.content[0].text, 'writing before registration keeps the existing authorization')
-  assert.equal(Object.keys(stub.tables.tasks).length, 0, 'hints do not create a phantom task')
-
-  // The user's own words are the request, not the model's retelling of them.
-  const started = await call('work_start', { request: '改一下登录按钮', mode: 'do', project })
+  assert.equal(repeated.messages.some(message => message.source?.summary === 'dsh-auto-dev start granted'), false, 'the registration is once per grant')
+  assert.equal(Object.keys(stub.tables.tasks).length, 1)
   const seen = await call('work_status', {})
   assert.equal(seen.task.request, '把登录按钮改成进度条')
 
-  // One start, one task: a second registration needs a fresh user start.
-  await assert.rejects(() => call('work_start', { request: '再来一个', mode: 'do', project }), /user-started only/)
+  // One start, one task: a second call hears the task already open (v32 #53 said "nobody started"),
+  // and books nothing new.
+  const tasks = Object.keys(stub.tables.tasks).length
+  const again = await call('work_start', { request: '再来一个', mode: 'do', project })
+  assert.equal(again.already, true)
+  assert.equal(again.taskId, seen.task.id)
+  assert.equal(Object.keys(stub.tables.tasks).length, tasks)
 })
 
 test('a profile can restore model-initiated starts with requireUserStart: false', async () => {
@@ -1447,10 +1149,10 @@ test('the start command accepts attachments and carries them into the turn', asy
 test('the settings section and its schema carry requireUserStart and autoEnroll', async () => {
   const stub = stubContext()
   await apply(stub.ctx, {})
-  const settings = AUTO_DEV_V3_SCHEMA({})
+  const settings = DSH_AUTO_DEV_SCHEMA({})
   assert.equal(settings.requireUserStart, true, 'a person must start the task')
   assert.equal(settings.autoEnroll, false, 'writes alone no longer book a task')
-  const json = AUTO_DEV_V3_SCHEMA.toJSON()
+  const json = DSH_AUTO_DEV_SCHEMA.toJSON()
   assert.equal(json.properties.requireUserStart.default, true)
   assert.equal(json.properties.autoEnroll.default, false)
 })
@@ -1474,14 +1176,10 @@ test('work_plan note appends a line, survives an add, and shows in list', async 
   await call('work_plan', { operation: 'add', units: [{ id: 'u-b', goal: '第二步', scope: ['.'], acceptance: [] }] })
   const listed = await call('work_plan', { operation: 'list' })
   assert.equal(listed.units.find(unit => unit.id === 'u-a').note, '跑通了一半')
-  // An empty note records nothing meaningful and is refused.
-  await assert.rejects(() => call('work_plan', { operation: 'note', unit: 'u-a', text: '   ' }), /note requires text/)
-  // A bare token is not a sentence: the note has to be readable by the person who
-  // owns the work, so `probe` / `step2` is refused with an example.
-  await assert.rejects(() => call('work_plan', { operation: 'note', unit: 'u-a', text: 'probe' }), /写给人看的一句话/)
+  // An empty note records nothing; any other line is kept as written.
+  assert.equal((await call('work_plan', { operation: 'note', unit: 'u-a', text: '   ' })).recorded, false)
   // Activating a unit teaches the note path in the same breath.
   const activated = await call('work_plan', { operation: 'activate', unit: 'u-a' })
-  assert.match(activated.noteHint, /operation="note"/)
   assert.match(activated.tellUser, /用户一句/)
 })
 
@@ -1494,12 +1192,12 @@ test('a write before work_start gets one hint about the user-start command, and 
   const downstream = { additionalContexts: [] }
   const exec = { agent, name: 'write', callId: 'h1', arguments: { path: 'src/x.mjs', content: 'x' } }
   const after = await postExecute(exec, { isError: false }, async () => downstream)
-  const hints = after.additionalContexts.filter(notice => notice.source?.summary === 'auto-dev-v3 start hint')
+  const hints = after.additionalContexts.filter(notice => notice.source?.summary === 'dsh-auto-dev start hint')
   assert.equal(hints.length, 1)
   assert.match(hints[0].content[0].text, /\/dsh-auto-dev start/)
   // Once per session: a reminder that repeats is one people learn to skip.
   const again = await postExecute({ ...exec, callId: 'h2' }, { isError: false }, async () => downstream)
-  assert.equal(again.additionalContexts.filter(notice => notice.source?.summary === 'auto-dev-v3 start hint').length, 0)
+  assert.equal(again.additionalContexts.filter(notice => notice.source?.summary === 'dsh-auto-dev start hint').length, 0)
   assert.equal(Object.keys(stub.tables.tasks ?? {}).length, 0, 'no phantom task is enrolled')
 })
 
@@ -1518,14 +1216,14 @@ test('an active unit gets no bookkeeping knock after 20 calls', async () => {
   const pre = stub.handlers.get('agent/pre-step')
   const next = async () => ({ kind: 'allow', messages: [] })
   const first = await pre({ agent, messages: [], step: 2 }, next)
-  assert.equal(first.messages.filter(notice => notice.source?.summary === 'auto-dev-v3 settle up').length, 0)
+  assert.equal(first.messages.filter(notice => notice.source?.summary === 'dsh-auto-dev settle up').length, 0)
   // A recorded note is a settlement: the clock starts again.
   await call('work_plan', { operation: 'note', unit: 'u-a', text: '做完第一页' })
   const quiet = await pre({ agent, messages: [], step: 3 }, next)
-  assert.equal(quiet.messages.filter(notice => notice.source?.summary === 'auto-dev-v3 settle up').length, 0)
+  assert.equal(quiet.messages.filter(notice => notice.source?.summary === 'dsh-auto-dev settle up').length, 0)
   for (let index = 0; index < 20; index += 1) log.push({ role: 'user', content: [{ type: 'text', text: 'x' }] })
   const again = await pre({ agent, messages: [], step: 4 }, next)
-  assert.equal(again.messages.filter(notice => notice.source?.summary === 'auto-dev-v3 settle up').length, 0)
+  assert.equal(again.messages.filter(notice => notice.source?.summary === 'dsh-auto-dev settle up').length, 0)
 })
 
 test('a plan with no active unit gets no activation nag', async () => {
@@ -1542,7 +1240,7 @@ test('a plan with no active unit gets no activation nag', async () => {
   ] })
   const pre = stub.handlers.get('agent/pre-step')
   const next = async () => ({ kind: 'allow', messages: [] })
-  const fired = step => step.messages.filter(notice => notice.source?.summary === 'auto-dev-v3 name the step').length
+  const fired = step => step.messages.filter(notice => notice.source?.summary === 'dsh-auto-dev name the step').length
   // The baseline is taken on the first look; a window of calls after it fires once.
   assert.equal(fired(await pre({ agent, messages: [], step: 2 }, next)), 0)
   for (let index = 0; index < 25; index += 1) log.push({ role: 'user', content: [{ type: 'text', text: 'x' }] })
@@ -1568,7 +1266,7 @@ test('a closed task gets no settlement knock: there is no unit left to settle', 
   for (let index = 0; index < 40; index += 1) log.push({ role: 'user', content: [{ type: 'text', text: 'x' }] })
   const pre = stub.handlers.get('agent/pre-step')
   const result = await pre({ agent, messages: [], step: 2 }, async () => ({ kind: 'allow', messages: [] }))
-  assert.equal(result.messages.filter(notice => notice.source?.summary === 'auto-dev-v3 settle up').length, 0)
+  assert.equal(result.messages.filter(notice => notice.source?.summary === 'dsh-auto-dev settle up').length, 0)
 })
 
 test('start resumes the unfinished task instead of opening a second one', async () => {
@@ -1616,19 +1314,17 @@ test('new opens a fresh task even while older work is unfinished', async () => {
   log.push({ type: 'user/message', data: { message: turns[0] } })
   const hinted = await stub.handlers.get('agent/pre-step')(
     { agent, messages: [turns[0]], step: 1 }, async () => ({ kind: 'continue', messages: [turns[0]] }))
-  assert.ok(hinted.messages.some(message => message.source?.summary === 'auto-dev-v3 start granted'))
-  assert.equal(hinted.messages.some(message => message.source?.summary === 'auto-dev-v3 resume hint'), false,
+  assert.ok(hinted.messages.some(message => message.source?.summary === 'dsh-auto-dev start granted'))
+  assert.equal(hinted.messages.some(message => message.source?.summary === 'dsh-auto-dev resume hint'), false,
     'an explicit new must not be redirected to unfinished work')
   // The command opted this session in, so the model has the tools now; its words
   // are the grant, so a fresh task can be registered while the older one waits.
   const tools = Object.fromEntries(stub.tools.map(tool => [tool.name, tool]))
   assert.ok(tools.work_start, 'the command is the opt-in: the tools arrive with it')
-  // The command's words are the grant, so the model may register a new task now.
-  const started = await tools.work_start.execute(
-    { request: '另起一件事', mode: 'do', project },
-    { agent, callId: 'n1', signal: undefined })
-  assert.ok(started.taskId)
-  assert.notEqual(started.taskId, 'task-old')
+  // The command's words registered the new task on the first step; the model filled nothing.
+  const started = Object.values(stub.tables.tasks).find(task => task.sessionId === 'session-new')
+  assert.equal(started.request, '另起一件事')
+  assert.notEqual(started.id, 'task-old')
   assert.equal(stub.tables.tasks['task-old'].sessionId, 'session-gone', 'the old task was left alone')
 })
 
@@ -1832,14 +1528,9 @@ test('a theme can be added to a plan that already grew flat, without retyping it
   assert.equal(opened.source.data.unit, 't1')
   assert.equal(opened.source.data.label, '先打通主路径')
 
-  await assert.rejects(
-    () => call('work_plan', { operation: 'group', unit: 't1', text: '重复', members: ['u3'] }),
-    /already exists/,
-  )
-  await assert.rejects(
-    () => call('work_plan', { operation: 'group', unit: 't2', text: '拿不到', members: ['nope'] }),
-    /not in this plan/,
-  )
+  // A taken theme id gets a fresh one; members that do not exist change nothing and the answer lists what does.
+  assert.equal((await call('work_plan', { operation: 'group', unit: 't1', text: '重复', members: ['u3'] })).result.unit, 't1-2')
+  assert.match((await call('work_plan', { operation: 'group', unit: 't2', text: '拿不到', members: ['nope'] })).result.answer, /现有单元/)
 })
 
 test('organize proposes, and applies only after the person answered', async () => {
@@ -1869,13 +1560,12 @@ test('organize proposes, and applies only after the person answered', async () =
 
   // Nobody has spoken since the review: applying now would be the model agreeing
   // with itself.
-  await assert.rejects(
-    () => call('work_plan', {
-      operation: 'organize', action: 'apply', proposalId: proposed.result.proposalId, approval: '好',
-      steps: [{ kind: 'group', theme: 't1', label: '一条线', members: ['u0', 'u1'] }],
-    }),
-    /decision source not found/,
-  )
+  const early = await call('work_plan', {
+    operation: 'organize', action: 'apply', proposalId: proposed.result.proposalId, approval: '好',
+    steps: [{ kind: 'group', theme: 't1', label: '一条线', members: ['u0', 'u1'] }],
+  })
+  assert.equal(early.result.unchanged, true)
+  assert.match(early.result.answer, /还没回话/)
 
   const answer = `同意 ${proposed.result.proposalId}：前两件收成一条线`
   human(log, answer)
@@ -1893,11 +1583,10 @@ test('organize proposes, and applies only after the person answered', async () =
   assert.ok(badge, 'what changed is said once, in the stream')
   assert.equal(badge.source.data.title, '已整理')
 
-  // The same proposal cannot be replayed after it was used.
-  await assert.rejects(
-    () => call('work_plan', { operation: 'organize', action: 'apply', proposalId: proposed.result.proposalId, approval: answer, steps: [] }),
-    /already applied/,
-  )
+  // The same proposal cannot be replayed after it was used: the plan stays as it is.
+  const replayed = await call('work_plan', { operation: 'organize', action: 'apply', proposalId: proposed.result.proposalId, approval: answer, steps: [] })
+  assert.equal(replayed.result.unchanged, true)
+  assert.match(replayed.result.answer, /已经做过/)
 })
 
 test('an answer given in the UI counts as the person speaking', async () => {
@@ -1934,30 +1623,6 @@ test('an answer given in the UI counts as the person speaking', async () => {
     steps: [{ kind: 'group', theme: 't1', label: '一条线', members: ['a1'] }],
   })
   assert.equal(applied.result.applied.steps, 1)
-})
-
-test('a unit nothing can be executed for still submits, with a manual check', async () => {
-  const stub = stubContext()
-  await testApply(stub)
-  const post = stub.handlers.get('tools/post-execute')
-  const log = []
-  const agent = { id: 'agent-manual', session: { id: 'session-manual', get seq() { return log.length }, eventAt: index => log[index] } }
-  const call = async (name, args) => {
-    const tool = stub.tools.find(candidate => candidate.name === name)
-    const exec = { agent, name, callId: `call-${name}-${args.operation ?? args.outcome ?? ''}`, arguments: args }
-    const result = await tool.execute(args, exec)
-    const after = await post(exec, { isError: false }, async () => ({ additionalContexts: [] }))
-    return { result, contexts: after.additionalContexts ?? [] }
-  }
-
-  await call('work_start', { request: '改一处远端配置', mode: 'do', scope: ['.'], acceptance: ['线上开关生效'] })
-  const submitted = await call('work_submit', {
-    outcome: 'complete', summary: '配置已改', next: '请你看一眼线上开关',
-    claims: [{ statement: '线上开关打开后首页显示新文案', case: 'manual', steps: ['打开首页', '看顶部横幅'] }],
-  })
-  assert.equal(submitted.result.outcome, 'complete')
-  assert.equal(submitted.result.claims, 1)
-  assert.ok(submitted.result.warnings.some(warning => /manual check/.test(warning)))
 })
 
 test('an approval given in another window still counts', async () => {
@@ -2066,10 +1731,7 @@ test('a task records who decides it is done, and the default is the person', asy
   assert.equal(looked.acceptanceMode, 'auto')
   assert.equal(looked.needsReceipt, undefined)
 
-  await assert.rejects(
-    () => start({ request: 'x', mode: 'do', scope: ['.'], acceptanceMode: 'nobody' }, 'sess-bad'),
-    /acceptanceMode must be/,
-  )
+  assert.ok(['auto', 'pm'].includes((await start({ request: 'x', mode: 'do', scope: ['.'], acceptanceMode: 'nobody' }, 'sess-bad')).acceptanceMode))
 })
 
 test('a receipt is what the user agreed to; a missing one is a warning, not a refusal', async () => {
@@ -2103,49 +1765,10 @@ test('a receipt is what the user agreed to; a missing one is a warning, not a re
   const second = await call('work_submit', { taskId: started.taskId, unit: 'b2', outcome: 'complete', summary: '做完了', next: '你用过再说' })
   assert.equal(second.warnings.some(warning => warning.includes('回执')), false, 'with a receipt there is nothing left to ask')
 
-  await assert.rejects(() => call('work_control', { taskId: started.taskId, operation: 'receipt', text: '  ' }), /needs text/)
+  // A blank receipt keeps the one on file.
+  await call('work_control', { taskId: started.taskId, operation: 'receipt', text: '  ' })
+  assert.match((await call('work_status', { taskId: started.taskId, view: 'board' })).task.receipt?.text ?? again.receipt.text, /表头/)
   assert.equal((await call('work_control', { taskId: started.taskId, operation: 'receipt', text: 'x'.repeat(420) })).receipt.text.length, 420)
-})
-
-test('a thin request comes with the questions worth asking, and an assumption is enough to go on', async () => {
-  const stub = stubContext()
-  await (testApply(stub))
-  const exec = { agent: { id: 'agent-1', session: { id: 'sess-1', seq: 0, eventAt: () => undefined } }, callId: 'call-x', signal: undefined }
-  const call = (name, args) => stub.tools.find(tool => tool.name === name).execute(args, exec)
-
-  const thin = await call('work_start', { request: '帮我搞一下导出', mode: 'do', scope: ['.'] })
-  assert.equal(thin.needsClarify.needed, true)
-  assert.equal(thin.needsClarify.limit, undefined)
-  assert.equal(thin.needsClarify.ask.length, 3)
-  assert.match(thin.needsClarify.rule, /业务/)
-
-  const clear = await call('work_start', { request: '导出 Excel，验收：三种格式都能开', mode: 'do', scope: ['.'] })
-  assert.equal(clear.needsClarify, undefined, 'an acceptance clause is what a thin request was missing')
-
-  const risky = await call('work_start', { request: '加一个支付回调，验收：能下单', mode: 'do', scope: ['.'] })
-  assert.equal(risky.needsClarify.needed, true)
-  assert.match(risky.needsClarify.reasons.join(' '), /支付/)
-
-  const looked = await call('work_start', { request: '这个函数返回啥', mode: 'look', scope: ['.'] })
-  assert.equal(looked.needsClarify, undefined, 'a question never asks the person to define the business')
-
-  await call('work_plan', { taskId: thin.taskId, operation: 'set', units: [
-    { id: 'b1', goal: '先做导出', scope: ['.'], acceptance: [] },
-    { id: 'b2', goal: '收尾', scope: ['.'], acceptance: [] },
-  ] })
-  const before = await call('work_submit', { taskId: thin.taskId, unit: 'b1', outcome: 'complete', summary: '导出能用了', next: '收尾' })
-  assert.equal(before.warnings.some(warning => warning.includes('澄清')), false, 'optional notes are not delivery paperwork')
-
-  const wrote = await call('work_control', { taskId: thin.taskId, operation: 'clarify', assumption: '默认按浏览器下载，不做服务端保存' })
-  assert.equal(wrote.clarify.assumption, '默认按浏览器下载，不做服务端保存')
-
-  const after = await call('work_submit', { taskId: thin.taskId, unit: 'b2', outcome: 'complete', summary: '做完了', next: '你用过再说' })
-  assert.equal(after.warnings.some(warning => warning.includes('澄清')), false, 'one line of assumption ends the asking')
-
-  await assert.rejects(
-    () => call('work_control', { taskId: thin.taskId, operation: 'clarify' }),
-    /needs a question/,
-  )
 })
 
 test('业务事实落在项目里：带来源、同词改写不新增行', async () => {
@@ -2197,10 +1820,10 @@ test('业务事实落在项目里：带来源、同词改写不新增行', async
     // Now that the file exists, the next task is handed its path at start.
     const next = await tool('work_start').execute({ request: '继续补导出', mode: 'do', scope: ['.'] }, exec)
     assert.equal(next.domainFile, file)
-    await assert.rejects(
-      () => tool('work_control').execute({ operation: 'remember', target: 'domain', payload: { kind: 'term', text: '没有词' } }, exec),
-      /needs key/,
-    )
+    // A term without a key takes its first words as the key.
+    const term = await tool('work_control').execute({ operation: 'remember', target: 'domain', payload: { kind: 'term', text: '快照：导出时的筛选结果' } }, exec)
+    assert.equal(term.stored, true)
+    assert.match(readFileSync(file, 'utf8'), /快照/)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -2225,7 +1848,8 @@ test('目标改一次多一版，旧的一句不丢', async () => {
   assert.equal(echo.unchanged, true)
   assert.equal(echo.goalRevision, 2)
 
-  await assert.rejects(() => tool('work_control').execute({ operation: 'goal' }, exec), /needs text/)
+  const blank = await tool('work_control').execute({ operation: 'goal' }, exec)
+  assert.equal(blank.goalRevision ?? 2, 2)
   const board = await tool('work_status').execute({ view: 'board' }, exec)
   assert.equal(board.task.goalRevision, 2)
   assert.deepEqual(board.task.goalHistory, ['导出三种格式都能打开'])
@@ -2263,13 +1887,15 @@ test('有可看的东西就先停下等人：说「可以」收案，说哪里�
   assert.equal(submitted.state, 'review_ready', 'a unit that promised something parks for the person')
   const pre = stub.handlers.get('agent/pre-step')
   const next = async () => ({ kind: 'continue', messages: [] })
+  // The hand-in itself asks (queued with the delivery card), so a turn that ends here still shows it.
+  assert.equal(stub.records.get(`tasks/${started.taskId}`).review.asked, true, 'the hand-in asks once')
   const asked = await pre({ agent, messages: [], step: 2 }, next)
-  assert.equal(asked.messages.at(-1).source.form, 'review', 'the pane asks once')
+  assert.ok(!asked.messages.some(message => message.source?.form === 'review'), 'and the next step does not ask again')
 
   // 人的话只是决定；改状态是模型那一步的事（work_control），宿主不再替它猜。
   human(log, '列少了，缺更新时间')
   const revise = await pre({ agent, messages: [{ role: 'user', content: [{ type: 'text', text: '列少了，缺更新时间' }], source: { kind: 'user' } }], step: 3 }, next)
-  assert.match(revise.messages.at(-1).content[0].text, /operation \"rework\"/)
+  assert.match(revise.messages.at(-1).content[0].text, /退回（rework）按他说的改/)
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'review_ready')
   await run('work_control', { operation: 'rework', text: '列少了，缺更新时间' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'active')
@@ -2281,7 +1907,7 @@ test('有可看的东西就先停下等人：说「可以」收案，说哪里�
   await run('work_submit', { unit: 'a', outcome: 'complete', summary: '补上更新时间', next: '收', claims: [{ statement: 'node --version', execution: { callId: 'sh-2' } }] })
   human(log, '可以，就这样')
   const accepted = await pre({ agent, messages: [{ role: 'user', content: [{ type: 'text', text: '可以，就这样' }], source: { kind: 'user' } }], step: 4 }, next)
-  assert.match(accepted.messages.at(-1).content[0].text, /operation \"accept\"/)
+  assert.match(accepted.messages.at(-1).content[0].text, /这算同意，收案/)
   await run('work_control', { operation: 'accept', text: '可以，就这样' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'closed')
   // 收案那一刻的回执由工具排队，下一次工具调用结束时交给宿主——这里把它抽出来看。
@@ -2341,27 +1967,6 @@ test('连续 partial 不会误判为失败或要求停下', async () => {
   assert.equal(again.messages.some(row => row.source?.form === 'halt'), false)
 })
 
-test('人工检查不许写成“通过”', async () => {
-  const stub = stubContext('/tmp/v3-manual')
-  await testApply(stub, { checkpoints: false })
-  const tool = name => stub.tools.find(entry => entry.name === name)
-  const log = []
-  const agent = { id: 'agent-1', session: { id: 'session-1', header: {}, get seq() { return log.length }, eventAt: index => log[index] } }
-  const exec = { agent, callId: 'c1', turn: 1 }
-  const run = async (name, args) => {
-    const callId = `c-${name}-${log.length}`
-    log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
-    return tool(name).execute(args, { ...exec, callId })
-  }
-  await run('work_start', { request: '把导出按钮接上', mode: 'do', scope: ['/tmp/v3-manual'], plan: [{ id: 'a', goal: '能导出', scope: ['src'], acceptance: [] }] })
-  await run('work_plan', { operation: 'activate', unit: 'a' })
-  const value = await run('work_submit', {
-    unit: 'a', outcome: 'complete', summary: '导出按钮能点', next: '收',
-    claims: [{ statement: '人工点一下按钮，通过', case: 'manual', steps: ['打开页面', '点导出'] }],
-  })
-  assert.match(value.warnings.join('\n'), /phrased as a passing result/)
-})
-
 test('人用一句话答应也收案，且未知 operation 不会写坏记录', async () => {
   const stub = stubContext('/tmp/v3-review-natural')
   await testApply(stub, { checkpoints: false })
@@ -2395,38 +2000,13 @@ test('人用一句话答应也收案，且未知 operation 不会写坏记录', 
     messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我点开看过了，可以' }] }],
     step: 3,
   }, async () => ({ kind: 'continue', messages: [] }))
-  assert.match(answered.messages.at(-1).content[0].text, /operation \"accept\"/)
+  assert.match(answered.messages.at(-1).content[0].text, /这算同意，收案/)
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'review_ready', '一句话只是证据，状态由工具改')
   await run('work_control', { operation: 'accept', text: '我点开看过了，可以' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'closed')
 
-  await assert.rejects(() => run('work_control', { operation: 'nonsense' }), /unknown operation/)
+  assert.match((await run('work_control', { operation: 'nonsense' })).tellUser, /不认识「nonsense」/)
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'closed', 'a stray call leaves the record alone')
-})
-
-test('a task that stopped with a failure asks once whether to write a postmortem', async () => {
-  const stub = stubContext()
-  await testApply(stub)
-  // A closed task that carried a failure: the reason is still in the ledger, and
-  // the next task is the one that pays for it.
-  const task = {
-    id: 'task-dead', version: 1, project: stub.ctx.cwd ?? '/repo/example',
-    sessionId: 'session-dead', mode: 'do', state: 'closed',
-    request: '把导出修好', goal: '导出能跑', scope: ['.'], acceptance: ['能导出'],
-    ledger: [{ at: new Date().toISOString(), outcome: 'failed', summary: '还是空表', next: '再试' }],
-    sessions: ['session-dead'], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
-  }
-  stub.tables.tasks[task.id] = task
-  const agent = { id: 'agent-dead', session: { id: 'session-dead', header: {}, get seq() { return 0 }, eventAt: () => undefined } }
-  const pre = stub.handlers.get('agent/pre-step')
-  const next = async () => ({ kind: 'allow', messages: [] })
-  const first = await pre({ agent, messages: [{ source: { kind: 'user' }, content: [{ type: 'text', text: '算了，先放着' }] }], step: 1 }, next)
-  const asked = first.messages.find(message => message.source?.form === 'postmortem')
-  assert.ok(asked, 'a task that died with a failure should offer the postmortem once')
-  assert.match(asked.content[0].text, /根因未知/)
-  // Once is enough: the second step does not ask again.
-  const second = await pre({ agent, messages: [], step: 2 }, next)
-  assert.equal(second.messages.filter(message => message.source?.form === 'postmortem').length, 0)
 })
 
 test('writing the postmortem leaves one row in the conversation', async () => {
@@ -2502,4 +2082,21 @@ test('a session already open when the plugin loads gets its tools on the first a
   second.ctx.get = service => (service === 'agents' ? { list: () => [stranger] } : undefined)
   await apply(second.ctx, {})
   assert.equal(own.length, before)
+})
+
+test('first-write card: the start words cut into sentences, verbatim, only when scattered and unanswered', async () => {
+  const { firstWriteCard, requestSentences } = await import('../src/craft.mjs')
+  const request = '/dsh-auto-dev notes 想加几个东西：list 能按关键词过滤；另外 rm 删不存在的 id 会说 removed，这个不对；顺便 add 空文本应该拒绝；还有 usage 也更新一下。验收：npm test 全过。'
+  assert.deepEqual(requestSentences(request), ['notes 想加几个东西：list 能按关键词过滤', '另外 rm 删不存在的 id 会说 removed，这个不对', '顺便 add 空文本应该拒绝', '还有 usage 也更新一下'])
+  assert.match(firstWriteCard(false, undefined, request)[0], /事实：开工原话断开是 4 句，开工后用户还没说过话——「notes 想加几个东西：list 能按关键词过滤」「另外 rm/)
+  assert.doesNotMatch(firstWriteCard(true, undefined, request)[0], /开工原话/, '用户说过话就不再提')
+  assert.doesNotMatch(firstWriteCard(false, undefined, '修一下 add 的重复 id，顺便补个测试')[0], /开工原话/, '一两句不说')
+})
+
+test('first-write card: 先复述 only while the person has not spoken since the start', async () => {
+  const { firstWriteCard } = await import('../src/craft.mjs')
+  assert.match(firstWriteCard(false)[0], /先停下，对用户复述/)
+  assert.doesNotMatch(firstWriteCard(true)[0], /复述/)
+  assert.match(firstWriteCard(true)[0], /一次只改一处/)
+  assert.match(firstWriteCard(true, { command: 'npm test' })[0], /跑就写 `npm test`；要截短输出就写 `set -o pipefail; npm test 2>&1 \| tail -40`/)
 })

@@ -1,8 +1,6 @@
 # dsh-auto-dev: one host plugin row. Everything the model sees (six tools,
-# two hooks) and everything a human sees (the `auto-dev-v3` settings section,
+# two hooks) and everything a human sees (the `dsh-auto-dev` settings section,
 # the /dsh-auto-dev command and the board route) hangs off this single entry.
-# The settings key, checkpoint refs, export format and message source kinds
-# still carry the v3 suffix; the slash command and the package do not.
 # No preset: the plugin is active in every session of the profile, and a task
 # starts when a session calls work_start (or when an unregistered write is
 # observed for the first time).

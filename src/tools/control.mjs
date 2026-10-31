@@ -1,4 +1,5 @@
-import { controlTransition, decisionSource, grantsAction } from '../decisions.mjs'
+import { consent, controlTransition, decisionSource } from '../decisions.mjs'
+import { GateError } from '../gate.mjs'
 import { rememberDomain } from '../domain.mjs'
 import { recordTask } from '../task-record.mjs'
 import { listCheckpoints, restoreCheckpoint } from '../checkpoint.mjs'
@@ -23,8 +24,8 @@ export const workControl = api => (
     // Adopt names a task that is not this session's yet, so it resolves from the
     // taskId alone — the same reason import gets to run before there is a task.
     if (args.operation === 'adopt') return api.adoptTask(args, exec.agent)
-    const task = args.taskId ? api.requireTask(undefined, args.taskId, { agent: exec.agent }) : (api.activeTask(exec.agent) ?? api.latestTask(exec.agent))
-    if (!task) throw new Error('no task in this session: call work_start first')
+    const task = api.requireTask(api.activeTask(exec.agent) ?? api.latestTask(exec.agent), args.taskId)
+    if (!task) return api.noTask(exec.agent)
     if (args.operation === 'export') return api.exportSnapshot(task, api.observationsOf(exec.agent))
     // A one-call read of where the task stands, for hosts that want the shape
     // without the board's rendering fields.
@@ -42,10 +43,15 @@ export const workControl = api => (
         return { taskId: task.id, state: task.state, unchanged: true }
       }
       if (task.state !== 'review_ready') {
-        throw new Error(`only a task parked for review can be accepted or sent back; this one is ${task.state ?? 'unknown'}`)
+        return { taskId: task.id, state: task.state, unchanged: true, tellUser: '现在没有在等用户验收的交付，什么都没动。' }
       }
-      const quote = typeof args.text === 'string' ? args.text.trim() : ''
-      const source = decisionSource({ agent: exec.agent, task, quote, after: task.review?.atSeq ?? api.seq(exec.agent), subject: task.id, intent: args.operation })
+      // The person's own reply after the hand-in is the decision; the model's text is not.
+      const source = decisionSource({ agent: exec.agent, task, after: task.review?.atSeq ?? 0, subject: task.id })
+      if (!source) return { taskId: task.id, state: task.state, unchanged: true, tellUser: '用户还没回话：等他看过再说。' }
+      if (args.operation === 'accept' && source.refused) {
+        return { taskId: task.id, state: task.state, unchanged: true, tellUser: `用户的回话不是同意（「${source.quote.slice(0, 80)}」）：按他说的改，或者再问一句。` }
+      }
+      const quote = source.quote
       const now = new Date().toISOString()
       if (args.operation === 'accept') {
         const updated = await api.records.change('tasks', task.id, current => ({
@@ -56,7 +62,7 @@ export const workControl = api => (
         }))
         api.queueNotice(exec.agent,
           `**收案 · ${updated.id}** — 这一版收下了`,
-          'auto-dev-v3 review done',
+          'dsh-auto-dev review done',
           { form: 'review-done', data: { unit: updated.id, title: '已收案', line: quote || '这一版收下了', tag: '已收', tone: 'done' } })
         return { taskId: updated.id, state: updated.state, accepted: updated.accepted, tellUser: '告诉用户这一版收下了；下次要继续就开新任务。' }
       }
@@ -73,9 +79,9 @@ export const workControl = api => (
       await api.records.change('tasks', task.id, current => ({ ...current, startedSeq: api.seq(exec.agent) }))
       api.queueNotice(exec.agent,
         `**退回 · ${updated.id}** — ${quote || '按意见改'}`,
-        'auto-dev-v3 review revise',
+        'dsh-auto-dev review revise',
         { form: 'review-revise', data: { unit: updated.id, title: '按意见改', line: quote || '按意见改', tag: '继续修改', tone: 'neutral' } })
-      return { taskId: updated.id, state: updated.state, rework: updated.rework, tellUser: '问清是哪里不对，改完再 work_submit 一次。' }
+      return { taskId: updated.id, state: updated.state, rework: updated.rework, tellUser: '问清是哪里不对，改完再交一次。' }
     }
     if (['record', 'goal', 'receipt', 'clarify', 'alternative', 'postmortem'].includes(args.operation)) return recordTask(api, task, args, exec)
     if (args.operation === 'remember') {
@@ -89,14 +95,17 @@ export const workControl = api => (
         })
         api.queueNotice(exec.agent,
           `**记住** — ${String(payload.text ?? payload.key ?? '').trim().slice(0, 40)}`,
-          'auto-dev-v3 remember',
+          'dsh-auto-dev remember',
           { form: 'remember', data: { unit: task.id, title: '记住', line: String(payload.text ?? payload.key ?? '').trim().slice(0, 40), tag: '1 条', tone: 'info' } })
         return { taskId: task.id, ...stored, tellUser: '把这条业务事实给用户看一眼（一行），他改口就用同一句再记一次。' }
       }
+      // `text` alone is a fact: v16 wrote {operation:'remember', text} after the
+      // perf card asked for one and got "an incident needs a symptom".
+      if (!args.payload && typeof args.text === 'string') args = { ...args, payload: { kind: 'fact', text: args.text } }
       const stored = remember(task.project, args.payload ?? {}, { taskId: task.id, session: api.sessionId(exec.agent) })
       api.queueNotice(exec.agent,
         `**记住** — ${String(args.payload?.symptom ?? args.payload?.text ?? args.payload?.key ?? '').trim().slice(0, 40)}`,
-        'auto-dev-v3 remember',
+        'dsh-auto-dev remember',
         { form: 'remember', data: { unit: task.id, title: '记住', line: String(args.payload?.symptom ?? args.payload?.text ?? args.payload?.key ?? '').trim().slice(0, 40), tag: '1 条', tone: 'info' } })
       return { taskId: task.id, ...stored }
     }
@@ -118,11 +127,17 @@ export const workControl = api => (
         : target === 'latest' ? rows[rows.length - 1]
           : target === 'before' ? [...rows].reverse().find(row => row.tag === 'before')
             : rows.find(row => row.ref === target || row.commit === target)
-      if (!pick) throw new Error(`this task has no checkpoint matching "${target}" — call work_control operation "checkpoints" to see what exists`)
+      if (!pick) return { taskId: task.id, restored: false, checkpoints: rows.map(row => ({ ref: row.ref ?? row.commit, label: row.label, tag: row.tag })), tellUser: rows.length ? `没有「${label || target}」这个存档点，现有的列在 checkpoints 里。` : '这个任务还没有存档点，没法回滚。' }
       const action = `rollback ${pick.ref ?? pick.commit}`
-      if (!grantsAction(task, 'rollback', action, { agent: exec.agent })) throw new Error(`rollback overwrites uncommitted work: use work_extend kind="authorization", risk="rollback", action="${action}" with the owner's exact answer before restoring`)
+      // G2: a rollback overwrites work that was never committed. Asked once, then the person's reply decides.
+      const asked = consent(api.sessionState(exec.agent), exec.agent, task, 'rollback', api.seq(exec.agent))
+      if (!asked.granted) {
+        throw new GateError('G2', `回滚会覆盖还没提交的改动（${action}）`, asked.refused
+          ? `用户没同意（「${asked.refused.slice(0, 60)}」）：换一个不丢改动的做法`
+          : `先问用户「要回到 ${pick.label || pick.ref || pick.commit} 吗？没提交的改动会丢」，他回了再回滚`)
+      }
       const restored = await restoreCheckpoint(task.project, pick.commit)
-      if (!restored.ok) throw new Error(restored.reason)
+      if (!restored.ok) return { taskId: task.id, restored: false, reason: restored.reason, tellUser: `回滚没成：${restored.reason}` }
       await api.records.change('tasks', task.id, current => ({
         ...current, updatedAt: new Date().toISOString(),
         stateReason: `rolled back to ${pick.ref}`,
@@ -131,7 +146,7 @@ export const workControl = api => (
     }
     const transition = controlTransition(task.state, args.operation)
     const next = transition.state
-    if (!transition.changed) return { taskId: task.id, state: task.state, unchanged: true }
+    if (!transition.changed) return { taskId: task.id, state: task.state, unchanged: true, ...(transition.answer ? { tellUser: transition.answer } : {}) }
     const updated = await api.records.change('tasks', task.id, current => ({
       ...current, state: next, updatedAt: new Date().toISOString(),
       ...(args.reason ? { stateReason: args.reason } : {}),

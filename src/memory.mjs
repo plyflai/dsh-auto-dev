@@ -66,16 +66,22 @@ export function relatedRows(rows, { query = '', limit, text = row => row.text } 
     .sort((a, b) => b.score - a.score || b.index - a.index).slice(0, limit).map(item => item.row)
 }
 
+/** What an incident is searched by: its symptom and everything learned about it. */
+export const incidentText = row => [row.symptom, row.mechanism, row.finding, row.lesson, row.check, ...(row.ruledOut ?? [])].filter(Boolean).join(' ')
+
 export function memoryBrief(memory, { facts = 5, incidents = 3, query = '' } = {}) {
   return {
     facts: relatedRows(memory.facts, { query, limit: facts }).map(row => row.text),
-    incidents: relatedRows(memory.incidents, { query, limit: incidents, text: row => `${row.symptom} ${row.mechanism ?? ''} ${row.finding ?? ''}` }).map(row => ({
+    incidents: relatedRows(memory.incidents, { query, limit: incidents, text: incidentText }).map(row => ({
       symptom: row.symptom,
       ...(row.mechanism ? { mechanism: row.mechanism } : {}),
       ...(row.repair ? { repair: row.repair } : {}),
       ...(row.finding ? { finding: row.finding } : {}),
       ...(row.prevention ? { prevention: row.prevention } : {}),
       ...(row.hypothesis ? { hypothesis: row.hypothesis } : {}),
+      ...(row.ruledOut?.length ? { ruledOut: row.ruledOut } : {}),
+      ...(row.check ? { check: row.check } : {}),
+      ...(row.lesson ? { lesson: row.lesson } : {}),
       status: row.mechanism ? 'recorded-mechanism' : 'observation',
     })),
     counts: { facts: memory.facts.length, incidents: memory.incidents.length },
@@ -99,34 +105,39 @@ function uncertainMechanism(cause) {
   return /未知|不明|不确定|尚未|未(?:能|经)?(?:确认|查明|证实)|未明|待(?:查|定|确认)|可能|疑似|假设|推测|怀疑|或许|\b(?:unknown|unclear|uncertain|unconfirmed|tbd|maybe|perhaps|suspect(?:ed)?|hypothes(?:is|ized)|may|might|could|not\s+(?:yet\s+)?(?:known|confirmed|verified|established|understood)|do\s+not\s+know|don't\s+know|not\s+sure)\b/i.test(current)
 }
 
+const listOf = value => (Array.isArray(value) ? value : value ? [value] : []).map(item => String(item).trim()).filter(Boolean)
+
 /** Record one project learning; identical entries are not stored twice. */
 export function remember(project, input, { taskId, session } = {}) {
   const memory = readMemory(project)
   const at = new Date().toISOString()
-  // A memory that only grows stops being read: at the ceiling the answer is
-  // "merge two entries", not "raise the ceiling".
-  const total = memory.facts.length + memory.incidents.length
-  if (total >= MAX_FACTS + MAX_INCIDENTS) {
-    throw new Error(`记忆已经 ${total} 条（上限 ${MAX_FACTS + MAX_INCIDENTS}）：把同类的合并一条、或者删掉过时的，再记新的。`)
-  }
+  // A memory that only grows stops being read: at the ceiling the oldest entry of the
+  // same kind makes room (write() keeps the newest of each list), and the answer says which.
+  const full = input.kind === 'fact' ? memory.facts.length >= MAX_FACTS : memory.incidents.length >= MAX_INCIDENTS
+  const evicted = full ? (input.kind === 'fact' ? memory.facts[0]?.text : memory.incidents[0]?.symptom) : undefined
   const source = { session: typeof session === 'string' ? session : undefined, at }
   if (input.kind === 'fact') {
     const text = String(input.text ?? '').trim()
-    if (text === '') throw new Error('a fact needs its text: state the reusable thing plainly, without a file path or a temporary decision')
+    if (text === '') return { stored: false, kind: 'fact', reason: '没有内容，没记' }
     if (memory.facts.some(row => row.text === text)) return { stored: false, kind: 'fact', text, reason: 'the project already knows this fact' }
     memory.facts.push({ id: `fact-${randomUUID().slice(0, 8)}`, text, at, ...(taskId ? { taskId } : {}), ...(source.session ? { source } : {}) })
-    return { stored: true, kind: 'fact', text, path: write(project, memory) }
+    return { stored: true, kind: 'fact', text, path: write(project, memory), ...(evicted ? { evicted } : {}) }
   }
   const symptom = String(input.symptom ?? input.text ?? '').trim()
   const cause = String(input.mechanism ?? '').trim()
   const uncertain = uncertainMechanism(cause)
   const mechanism = uncertain ? '' : cause
   const repair = String(input.repair ?? '').trim()
-  if (symptom === '') throw new Error('an incident needs a symptom: what was observed, in the words a person would use')
+  if (symptom === '') return { stored: false, kind: 'incident', reason: '没有写看到了什么，没记' }
   const row = { symptom, ...(mechanism ? { mechanism } : {}), status: mechanism ? 'recorded-mechanism' : 'observation',
     ...(uncertain ? { hypothesis: cause } : {}),
     ...(repair ? { repair } : {}), ...(input.finding ? { finding: String(input.finding).trim() } : {}),
-    ...(input.prevention ? { prevention: String(input.prevention).trim() } : {}) }
+    ...(input.prevention ? { prevention: String(input.prevention).trim() } : {}),
+    // What was ruled out, the check that went green, the one-line lesson: the
+    // parts of a postmortem the next person with the same symptom needs first.
+    ...(listOf(input.ruledOut).length ? { ruledOut: listOf(input.ruledOut) } : {}),
+    ...(input.check ? { check: String(input.check).trim() } : {}),
+    ...(input.lesson ? { lesson: String(input.lesson).trim() } : {}) }
   const prior = memory.incidents.find(item => item.symptom === symptom && (item.mechanism ?? '') === mechanism)
   if (prior) {
     const changed = Object.entries(row).some(([key, value]) => prior[key] !== value)
@@ -135,5 +146,5 @@ export function remember(project, input, { taskId, session } = {}) {
     return { stored: true, updated: true, kind: 'incident', ...row, path: write(project, memory) }
   }
   memory.incidents.push({ id: `incident-${randomUUID().slice(0, 8)}`, ...row, at, ...(taskId ? { taskId } : {}), ...(source.session ? { source } : {}) })
-  return { stored: true, kind: 'incident', ...row, path: write(project, memory) }
+  return { stored: true, kind: 'incident', ...row, path: write(project, memory), ...(evicted ? { evicted } : {}) }
 }

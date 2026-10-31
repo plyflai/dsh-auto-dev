@@ -1,75 +1,115 @@
 import { describeChild, describeRecord } from '../child-sessions.mjs'
-import { approvedReduction, namesCommand, reconcileDelegation, validateSubmission } from '../task.mjs'
-import { leafUnits, nextUnit, runnableUnits } from '../plan.mjs'
-import { failureContext } from '../craft.mjs'
-import { uiMissing } from '../uicheck.mjs'
+import { approvedReduction, reconcileDelegation, validateSubmission, windowObservations, windowStart } from '../task.mjs'
+import { leafUnits, nextUnit } from '../plan.mjs'
+import { deliveryOnce, reviewCard } from '../craft.mjs'
+import { checkRuns, fixesIn, incidentsChangedAt, INCIDENTS_FILE, redStreak, runCheck, tailOf, trimIncidents } from '../facts.mjs'
+import { changedPaths, fingerprint, markGreen, marksOf } from '../disk.mjs'
+import { blockedBy, readEnv } from '../env.mjs'
 import { recordWaiting } from '../task-record.mjs'
-import { string, strings, claimsSchema, touchesScreen, browserEvidence, containersOf, childrenOf, DAILY_UNIT } from './shared.mjs'
+import { GateError } from '../gate.mjs'
+import { noteTrail } from '../trail.mjs'
+import { shareIncidents } from '../team.mjs'
+import { string, strings, claimsSchema, containersOf, childrenOf, DAILY_UNIT } from './shared.mjs'
+
+/**
+ * G1: the tree being handed in passed the project's check. When the last green
+ * the plugin saw covers a different tree (or there was none), the plugin runs the
+ * check itself — its own act, so nothing about the model's commands is guessed.
+ */
+async function g1(api, task, agent, verifier) {
+  if (!verifier?.command) return undefined
+  // Outside git there is no fingerprint to compare, so the check runs every time.
+  const now = await fingerprint(task.project)
+  const green = marksOf(task.id).green
+  if (now && green?.print?.id === now.id) return undefined
+  const result = await runCheck(task.project, verifier)
+  // A refusal leaves the records as they were (P0 U01); a red here is told to the model on the spot.
+  if (!result.ok) return { red: tailOf(result.output, 20) }
+  await noteTrail(api.records, task.id, () => ({ check: { command: verifier.command.trim(), ok: true, tail: tailOf(result.output, 12), at: new Date().toISOString(), by: 'plugin' } }))
+  await markGreen(task.project, task.id, api.seq(agent))
+  // The plugin's own green is a run too: after the model's reds it closes the fix (G4).
+  return { green: { seq: api.seq(agent), callId: 'plugin:g1', time: Date.now(), command: verifier.command.trim(), ok: true, output: tailOf(result.output, 20) } }
+}
+
+async function g3(task) {
+  const start = marksOf(task.id).start
+  if (!start) return undefined
+  const env = await readEnv(task.project)
+  if (!env.blocked?.length) return undefined
+  return blockedBy(env, await changedPaths(task.project, start, await fingerprint(task.project)))
+}
+
+/**
+ * G4: a check that went red twice and then green is a fix, and a fix leaves a
+ * postmortem in the incidents file. Whether it was a bug is the model's call —
+ * one line「有意的红」there passes too. The plugin looks only at the file.
+ */
+function g4(task, runs) {
+  const fix = fixesIn(runs).at(-1)
+  if (!fix) return undefined
+  // Written since the task started (file times on both sides, no clock compared to the log),
+  // or, for a task this process did not see start, after the green run.
+  const start = marksOf(task.id).incidentsAt
+  const at = incidentsChangedAt(task.project)
+  const written = start !== undefined ? at > start : at >= (fix.green.time ?? Infinity)
+  return written ? undefined : fix
+}
 
 export const workSubmit = api => (
   // --------------------------------------------------------------- work_submit
-  ['work_submit', `Submit outcome + summary + next; continue authorized work unless the result names a real wait. Claims use statement + execution.callId from work_status executions; complete with acceptance needs fresh successful evidence after writes. Declared ui tiers, scope, dependencies and authority remain enforced; a partial result does not complete remaining work.`, {
+  ['work_submit', `Submit outcome + summary (next optional); continue authorized work unless the result names a real wait. Claims use statement + execution.callId from work_status executions; complete with acceptance needs fresh successful evidence after writes. Declared ui tiers, scope, dependencies and authority remain enforced; a partial result does not complete remaining work.`, {
     taskId: string, unit: string, outcome: { type: 'string', enum: ['complete', 'partial', 'blocked', 'failed'] },
     preserve: { type: 'array', items: { type: 'string' } }, tier: { type: 'string', enum: ['L1', 'L2', 'L3'] },
     summary: string, next: string, claims: claimsSchema, files: strings, residue: strings,
     limitations: strings,
-  }, ['outcome', 'summary', 'next'],
+  }, ['outcome', 'summary'],
   async (args, exec) => {
-    const task = api.requireTask(api.activeTask(exec.agent), args.taskId, { agent: exec.agent })
-    const plan = api.planOf(task)
-    const unit = args.unit
-      ? plan?.units.find(entry => entry.id === args.unit)
-      : (plan ? nextUnit(plan) : undefined)
-    if (args.unit && !unit) throw new Error(`unit "${args.unit}" is not in this plan`)
-    if (plan && !unit) throw new Error('work_submit: no runnable unit; inspect blocked/pending dependencies with work_plan list before submitting')
-    if (unit) {
-      api.assertLeaf(plan, unit.id)
-      if (!runnableUnits(plan.units).some(row => row.id === unit.id)) throw new Error(`work_submit: unit ${unit.id} is ${unit.state ?? 'pending'} or has unfinished dependencies; activate a runnable unit first`)
+    const task = api.requireTask(api.activeTask(exec.agent), args.taskId)
+    if (!task) return api.noTask(exec.agent)
+    // Delivered and waiting, or paused: nothing to hand in. Say so instead of refusing.
+    if (task.state && task.state !== 'active') {
+      return { taskId: task.id, state: task.state, waiting: task.state === 'review_ready' ? 'user-review' : task.state === 'paused' ? 'user-pause' : undefined,
+        tellUser: task.state === 'review_ready' ? '已经交付、在等用户看：不用再交，停下等他回话。' : `这个任务现在是 ${task.state}，没有记下这次提交；要接着做，先请用户恢复它。` }
     }
-    const observations = api.observationsOf(exec.agent)
-    const since = Math.max(task.startedSeq ?? 0, unit?.startedSeq ?? 0)
-    const window = { ...observations, results: observations.results.filter(row => row.seq >= since) }
-    const verdict = validateSubmission({ task, unit, args, observations: window, config: { ...api.settings(), project: task.project, agent: exec.agent } })
+    const plan = api.planOf(task)
+    // The unit handed in: the one named (a milestone means its next leaf), else the one in hand.
+    // A unit still waiting on others is handed in anyway — the work was done; the order was the plan's guess.
+    const named = plan?.units.find(entry => entry.id === args.unit) ?? plan?.units.find(entry => entry.state === 'active') ?? (plan ? nextUnit(plan) : undefined)
+    const unit = named ? api.leafOf(plan, named.id) : undefined
+    const window = windowObservations(api.observationsOf(exec.agent), task, unit)
+    const verifier = api.detectVerifier(task.project)
+    const verdict = validateSubmission({ task, unit, args, observations: window, config: { ...api.settings(), project: task.project, agent: exec.agent, verifier } })
     // A refusal is the plugin's call, not a failed tool: the person sees it once
     // per unit, in one line, instead of a red call they have to decode.
     const refused = line => api.blockedOnce(exec.agent, `submit:${task.id}:${unit?.id ?? ''}`,
       { unit: unit?.id, title: '拦下 · 交付退回', line })
-    if (!verdict.ok) {
-      refused(`${unit?.id ?? '这一步'} 的完成声明证据不够（${verdict.errors.length} 处）— 补跑检查后再交`)
-      const error = new Error(`work_submit refused:\n- ${verdict.errors.join('\n- ')}`)
-      error.details = { errors: verdict.errors, warnings: verdict.warnings }
-      throw error
+    const runs = checkRuns(window.results, verifier)
+    const handIn = verdict.outcome === 'complete' && task.mode !== 'look'
+    // G3 on disk: a file the person ruled out changed since the task started,
+    // whichever tool did it. Paths from two fingerprints, never shell text.
+    const banned = handIn ? await g3(task) : undefined
+    if (banned) {
+      refused(`改到了禁区 ${banned.path} — 撤回再交`)
+      throw new GateError('G3', `用户定过「${banned.row.value}」，这次改到了 ${banned.path}`, '撤回这处改动（可回存档）；真要动它，先问用户要不要解除这条')
     }
-    const uiGap = verdict.outcome === 'complete' && typeof unit?.ui === 'string' ? uiMissing({ unit, project: task.project, rows: window.results }) : undefined
-    if (uiGap) {
-      refused(`${unit.id} 写明了要${uiGap.check.name}，这次没跑 — 先跑 ${uiGap.check.command}`)
-      throw new Error(`这个单元声明了界面测试（${uiGap.tier}），但这次没跑过：${uiGap.check.name}用 ${uiGap.check.command}。跑一条，或把单元上的 ui 改档 / 设 false，再交。`)
+    const ran = handIn ? await g1(api, task, exec.agent, verifier) : undefined
+    const red = ran?.red
+    if (ran?.green) runs.push(ran.green)
+    if (red !== undefined) {
+      refused(`交付前插件跑了 ${verifier.command}，没通过 — 修好再交`)
+      throw new GateError('G1', `交付前插件在项目里跑了 \`${verifier.command}\`，没通过。输出末尾：\n${red}`, '修好让它通过，再交')
     }
-    // A unit that completes without ever running the command the repository
-    // declares as its check is not a failure — but the owner should see it.
-    const verifier = api.detectVerifier(task.project)
+    const fix = handIn ? g4(task, runs) : undefined
+    if (fix) {
+      refused(`修通过一次，${INCIDENTS_FILE} 还没写 — 写完再交`)
+      throw new GateError('G4', `\`${fix.green.command}\` 红了 ${fix.reds.length} 次后转绿，${INCIDENTS_FILE} 没有变化`,
+        `把这次写进 ${INCIDENTS_FILE}：症状、试过的方向、根因、修法、验证命令；红是有意的就写一行「有意的红」`)
+    }
+    // The project's postmortems go to the team's place too (D2), trimmed first.
+    if (handIn) { trimIncidents(task.project); shareIncidents(task.project) }
     // The same doubts as `warnings`, in the words the person reads on the receipt
     // and the board; `warnings` stays the model's instruction.
     const reminders = []
-    if (verdict.outside?.length) reminders.push(`改到了范围外：${verdict.outside.slice(0, 3).join('、')}${verdict.outside.length > 3 ? ' 等' : ''}`)
-    const screenGap = (unit?.ui === undefined || unit.ui === 'browser') && touchesScreen(unit, task) && !browserEvidence(args, window, task.project)
-    if (screenGap && verdict.outcome === 'complete') reminders.push('涉及界面，这次没有浏览器证据')
-    // A look task answers a question; it never runs the suite, and a do task with no
-    // claims asserted nothing to check. Only nag when something was actually claimed.
-    if (verifier && verdict.outcome === 'complete' && task.mode !== 'look' && verdict.claims.length > 0) {
-      // Compare against the recorded execution, not the claim's summary of it: the
-      // summary is truncated for display, so a long shell line that ends in `npm test`
-      // looked like it never ran the project's check.
-      const recorded = new Map(window.results.map(row => [row.callId, row]))
-      const ran = verdict.claims.some(claim => {
-        const row = recorded.get(claim.execution?.callId)
-        return typeof row?.command === 'string' && namesCommand(row.command, verifier.command)
-      })
-      if (!ran) {
-        reminders.push(`没跑项目检查 ${verifier.command}`)
-        verdict.warnings.push(`this unit completed without running the project's check "${verifier.command}" (${verifier.source}) — if another command is what proves it, the claim should say which`)
-      }
-    }
     // Read what the children did, so a delegation warning says something a
     // person can act on instead of "their writes are not in this task's log".
     const children = verdict.delegations ? await api.childWork(window.results, exec.agent) : []
@@ -92,14 +132,13 @@ export const workSubmit = api => (
     const pmJudges = (task.acceptanceMode ?? 'pm') === 'pm'
     const settledState = finishing ? (pmJudges ? 'review_ready' : 'closed') : undefined
     if (remaining.length && verdict.outcome === 'complete') verdict.warnings.push(`task remains active: ${remaining.map(row => `${row.id} (${row.state ?? 'pending'})`).join(', ')}; blocked, dropped and unmet dependencies are not completed work`)
-    // Progress is not failure. Repeated investigation comes only from actual
-    // execution results in the current evidence window, never warning wording.
-    const failure = failureContext(window.results, [...(task.ledger ?? []), entry])
-    if (failure) reminders.push(`${failure.command} 失败过 ${failure.count} 次`)
+    // Reds of the project's own check since its last pass: exit codes, nothing read.
+    const reds = redStreak(runs)
+    if (reds.length) reminders.push(`${reds[0].command} 还红着（连续 ${reds.length} 次）`)
     const lastPulse = task.pulse && typeof task.pulse === 'object' ? task.pulse : {}
     const pulse = { ...lastPulse,
-      submitsSinceProgress: failure?.count ?? 0, sameDefectCount: failure?.count ?? 0,
-      lastKey: failure?.key,
+      submitsSinceProgress: reds.length, sameDefectCount: reds.length,
+      lastKey: reds.length ? reds[0].command : undefined,
       ...(settledState === 'review_ready' ? { reviewAskedAt: undefined } : {}),
     }
     await api.records.change('tasks', task.id, current => ({
@@ -107,6 +146,10 @@ export const workSubmit = api => (
       ledger: [...(current.ledger ?? []), entry],
       updatedAt: now,
       pulse,
+      // Where the next unit's evidence window opens when the model goes straight
+      // on without activating it: the work before this point belongs to the unit
+      // just settled.
+      ...(unit && verdict.outcome === 'complete' ? { settledSeq: api.seq(exec.agent) } : {}),
       ...(settledState ? { state: settledState } : {}),
       ...(settledState === 'review_ready' ? { review: { at: now, atSeq: api.seq(exec.agent), asked: false } } : {}),
     }))
@@ -132,7 +175,7 @@ export const workSubmit = api => (
         if (before.length && before.every(kid => kid.state === 'done')) continue
         api.queueNotice(exec.agent,
           `**主题完成 · ${theme.goal}** — ${kids.length} 个单元全部完成`,
-          `auto-dev-v3 theme ${theme.id} sealed`,
+          `dsh-auto-dev theme ${theme.id} sealed`,
           { form: 'theme-seal', data: { unit: theme.id, label: theme.goal, line: `${kids.length} 个单元全部完成`, tag: '已收', tone: 'neutral' } })
       }
     }
@@ -153,6 +196,9 @@ export const workSubmit = api => (
         : await api.snapshot(api.records.get('tasks', task.id), 'after', { auto: true })
     // One line per submission, and the closing one is about the task, not the
     // unit: the last unit is not more interesting than the thing it finished.
+    // Hand-in is one of the moments the plugin speaks: the conditional sentences as a capsule, once per task.
+    const delivery = finishing ? await deliveryOnce(api, exec.agent, task) : undefined
+    if (delivery) api.queueNotice(exec.agent, ...delivery)
     if (verdict.outcome === 'complete') {
       const currentPlan = api.planOf(api.records.get('tasks', task.id))
       const following = currentPlan ? nextUnit(currentPlan) : undefined
@@ -164,15 +210,24 @@ export const workSubmit = api => (
       if (!parked || unit) {
         api.queueNotice(exec.agent,
           closing ? `**任务完成 · ${name}** — ${verdict.summary}` : `**${unit?.id ?? '这一步'} 完成** — ${verdict.summary}`,
-          closing ? 'auto-dev-v3 task done' : `auto-dev-v3 unit-done ${unit?.id ?? ''}`,
+          closing ? 'dsh-auto-dev task done' : `dsh-auto-dev unit-done ${unit?.id ?? ''}`,
           closing
             ? { form: 'task-done', data: { unit: unit?.id, title: `任务完成 · ${name}`, line: verdict.summary, tag: after?.ref ? `已存档 #${after.seq}` : '已收尾', tone: 'done', ...(reminders.length ? { warnings: reminders } : {}) } }
             : { form: 'unit-done', data: { unit: unit?.id, title: `${unit?.id ?? '这一步'} 完成`, line: verdict.summary, tag: following ? `下一步 ${following.id}` : parked ? '待验收' : '仍有未完成单元', tone: 'done', ...(reminders.length ? { warnings: reminders } : {}) } })
       }
+      // Parked for a person: the review card goes out with the hand-in itself, so a
+      // hand-in at turn end (no next step to carry it) still shows it where the turn ended.
+      const record = api.records.get('tasks', task.id)
+      if (parked && !record?.review?.asked) {
+        await api.records.change('tasks', task.id, current => ({
+          ...current, review: { ...(current.review ?? {}), asked: true, askedAt: new Date().toISOString() },
+        }))
+        api.queueNotice(exec.agent, ...reviewCard(record))
+      }
     } else if (promised && ['blocked', 'failed'].includes(verdict.outcome)) {
       api.queueNotice(exec.agent,
         `**${promised.id} 没通过** — ${verdict.summary}`,
-        `auto-dev-v3 unit-blocked ${promised.id}`,
+        `dsh-auto-dev unit-blocked ${promised.id}`,
         { form: 'unit-blocked', data: { unit: promised.id, title: `${promised.id} 没通过`, line: verdict.summary, tag: after?.ref ? `已存档 #${after.seq}` : '未存档', tone: 'blocked' } })
     }
     const refreshed = api.records.get('tasks', task.id)
@@ -183,24 +238,14 @@ export const workSubmit = api => (
     const touchedFiles = new Set([
       ...(Array.isArray(args.files) ? args.files.map(String) : []),
       ...(api.observationsOf(exec.agent).writes ?? [])
-        .filter(row => (row.seq ?? 0) > (unit?.startedSeq ?? task.startedSeq ?? 0))
+        .filter(row => (row.seq ?? 0) >= windowStart(task, unit))
         .map(row => String(row.path ?? row.file ?? '')),
     ])
     const derivedTier = touchedFiles.size >= 6 ? 'L3' : touchedFiles.size >= 3 ? 'L2' : 'L1'
     const tierRank = { L1: 1, L2: 2, L3: 3 }
     const claimedTier = typeof args.tier === 'string' && tierRank[args.tier] ? args.tier : undefined
     const tier = claimedTier && tierRank[claimedTier] <= tierRank[derivedTier] ? claimedTier : derivedTier
-    if (failure) warnings.push(`真实执行 ${failure.command} 失败 ${failure.count} 次：先复现、一次只验一个假设，再重跑；技术排查可继续，根因未知可保留（references/craft/debug.md）`)
-    // A person who asks for a button expects it clicked, not described. The
-    // default is a real browser run; when the unit touches a screen and nothing
-    // in this session opened one, say so once — a hint, never a refusal.
-    // The evidence has to come from this unit's window: a browser run in an
-    // earlier task does not cover the screen somebody is changing now.
-    // 界面单元声明了某一档，就必须有那档的执行记录（browser 覆盖 logic 覆盖 static）。
-    // 只认单元上写明的档：默认推断仍然只提醒，不拦——小改动不该等在一个跑不起来的套件后面。
-    if (screenGap) {
-      warnings.push('这个单元涉及界面，但这次没有浏览器证据：起服务后用非 headless 的 Playwright 点一遍，把截图路径或这次执行写进 claims（确实只能人工看，就在 summary 里说明）')
-    }
+    // Hand-in is one of the three moments the plugin speaks: conditional sentences only.
     return {
       taskId: task.id, outcome: verdict.outcome, warnings,
       state: refreshed.state, claims: verdict.claims.length,

@@ -3,8 +3,8 @@ import { UI_TIERS } from './uicheck.mjs'
 /**
  * A plan is a DAG of units, and a unit may contain units — that is what a
  * milestone is. There is no separate "compile" step: the host walks the tree,
- * finds the leaves that can start, and refuses a plan that lost a unit, hid a
- * cycle, or pointed a dependency at nothing. Everything else about a plan (how
+ * finds the leaves that can start, and repairs a plan that hid a cycle or
+ * pointed a dependency at nothing (`digestUnits`). Everything else about a plan (how
  * many units, how deep, what they contain) stays the model's judgement.
  *
  * One rule worth stating because it is not obvious: a milestone is only done
@@ -16,101 +16,127 @@ export const UNIT_STATES = ['pending', 'active', 'done', 'blocked', 'dropped']
 
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/
 
+/** A list the model may have written as one string, one value or nothing at all. */
+function strings(value) {
+  const list = Array.isArray(value) ? value : typeof value === 'string' ? value.split(/\n|；|;/) : []
+  return list.map(item => typeof item === 'string' ? item.trim() : typeof item === 'number' ? String(item) : '').filter(Boolean)
+}
+
+/** What a unit is called when the model gave it something other than a goal. */
+function goalOf(unit) {
+  for (const key of ['goal', 'title', 'name', 'text', 'description', 'summary']) {
+    if (typeof unit[key] === 'string' && unit[key].trim()) return unit[key].trim()
+  }
+  return ''
+}
+
 /**
  * Walk the tree and return a flat list, parents before children, each row
  * carrying `parent` and `depth`. Nested input and flat input both work, so a
  * model that writes one long list and a model that writes milestones produce
- * the same plan.
+ * the same plan. Whatever is not a unit (a bare string becomes a goal) is
+ * dropped, and a unit without a usable id gets one, so its children can name it.
  */
+/**
+ * Where a call put its units. Models write a plan as `steps`, `tasks` or `items`
+ * as often as `units`; an unread spelling silently emptied the plan (v27 #46).
+ */
+const UNIT_KEYS = ['units', 'steps', 'tasks', 'items', 'subtasks']
+export const unitsIn = value => {
+  if (Array.isArray(value) || typeof value === 'string') return value
+  const key = UNIT_KEYS.find(name => Array.isArray(value?.[name]) || (name === 'units' && typeof value?.[name] === 'string'))
+  return key ? value[key] : undefined
+}
+
 export function flattenUnits(units, parent = null, depth = 0, out = []) {
-  if (!Array.isArray(units)) throw new Error('a plan needs an array of units')
-  for (const [index, unit] of units.entries()) {
-    if (!unit || typeof unit !== 'object') throw new Error(`unit ${index + 1}${parent ? ` of "${parent}"` : ''} is not an object`)
-    if (unit.units !== undefined) {
-      if (!Array.isArray(unit.units)) throw new Error(`unit "${unit.id}" has a units field that is not an array`)
-      if (unit.units.length === 0) throw new Error(`unit "${unit.id}" contains no units: a milestone with no work is a note, not a unit`)
-    }
+  const found = unitsIn(units)
+  const list = Array.isArray(found) ? found : typeof found === 'string' && found.trim() ? [found] : []
+  for (const entry of list) {
+    const unit = typeof entry === 'string' ? (entry.trim() ? { goal: entry.trim() } : undefined) : entry
+    if (!unit || typeof unit !== 'object' || Array.isArray(unit)) continue
+    const raw = typeof unit.id === 'number' ? String(unit.id) : unit.id
+    const id = typeof raw === 'string' && ID_PATTERN.test(raw.trim()) ? raw.trim() : `u${out.length + 1}`
     // Drop the nested children from the flat row: the walk already emitted them,
     // and a leftover `units: undefined` would travel into tool output, which the
     // host refuses as not-lossless JSON.
-    const row = { ...unit }
-    delete row.units
+    const row = { ...unit, id }
+    const children = unitsIn(unit)
+    for (const key of UNIT_KEYS) delete row[key]
     // Re-flattening flat rows must change nothing: `validateUnits` flattens its
     // input, and callers legitimately hand it already-normalized units (a
     // milestone's `parent` would otherwise be overwritten with null and the
     // milestone would be judged as a leaf that forgot its scope).
     out.push({ ...row, parent: unit.parent ?? parent, depth: unit.depth ?? depth })
-    if (Array.isArray(unit.units)) flattenUnits(unit.units, unit.id, depth + 1, out)
+    if (Array.isArray(children)) flattenUnits(children, id, depth + 1, out)
   }
   return out
 }
 
-export function validateUnits(input) {
+/**
+ * Turn whatever the model wrote into a plan that can be scheduled: repair,
+ * default or drop, never refuse (设计约定「门禁定义」— a plan's shape is not a
+ * gate). Returns the flat units and one line per repair, for tests and notes.
+ *
+ * A duplicate id gets a suffix; a missing goal borrows title/name/text; a leaf
+ * without scope works on the whole project ('.'); acceptance may be empty; a
+ * dependency on itself, on nothing, or across its own milestone is dropped, and
+ * a cycle is broken by dropping the dependencies among the units caught in it.
+ */
+export function digestUnits(input) {
   const units = flattenUnits(input)
-  if (units.length === 0) throw new Error('a plan needs at least one unit')
+  const fixed = []
   const ids = new Set()
-  for (const [index, unit] of units.entries()) {
-    const id = unit.id
-    if (typeof id !== 'string' || !ID_PATTERN.test(id)) {
-      throw new Error(`unit ${index + 1} needs an id of letters, digits, dot, underscore or hyphen`)
+  for (const unit of units) {
+    if (ids.has(unit.id)) {
+      let n = 2
+      while (ids.has(`${unit.id}-${n}`)) n++
+      fixed.push(`id ${unit.id} 重复，第二个改成 ${unit.id}-${n}`)
+      unit.id = `${unit.id}-${n}`
     }
-    if (ids.has(id)) throw new Error(`unit id "${id}" is used twice: a plan identifies units by id`)
-    ids.add(id)
-    if (typeof unit.goal !== 'string' || unit.goal.trim() === '') throw new Error(`unit "${id}" needs a goal`)
-    // `deliverable` is what a person would be shown when this unit lands: it is
-    // optional, but an empty one is worse than none — it marks a unit as one that
-    // promises something a person can look at
-    // and then cannot name it.
-    if (unit.deliverable !== undefined
-      && (typeof unit.deliverable !== 'string' || unit.deliverable.trim() === '')) {
-      throw new Error(`unit "${id}" has an empty deliverable: name what a person would see, or leave the field out`)
-    }
+    ids.add(unit.id)
+    const goal = goalOf(unit)
+    if (!goal) fixed.push(`${unit.id} 没写目标`)
+    unit.goal = goal || `单元 ${unit.id}`
+    // `deliverable` is what a person would be shown when this unit lands: an
+    // empty one is worse than none, so it is left out.
+    if (unit.deliverable !== undefined && (typeof unit.deliverable !== 'string' || unit.deliverable.trim() === '')) delete unit.deliverable
     // A milestone holds work rather than doing it: its scope is what its leaves
-    // touch and its acceptance is their acceptance, so demanding them again is
-    // the same rule stated twice — and the second statement is the one a person
-    // gets wrong.
-    const isMilestone = units.some(candidate => candidate.parent === id)
-    if (!isMilestone) {
-      if (!Array.isArray(unit.scope) || unit.scope.length === 0) throw new Error(`unit "${id}" needs a non-empty scope`)
-      if (!Array.isArray(unit.acceptance)) throw new Error(`unit "${id}" needs an acceptance array (it may be empty)`)
-    }
+    // touch, so only a leaf gets the whole project when it names nothing.
+    const isMilestone = units.some(candidate => candidate.parent === unit.id)
+    const scope = strings(unit.scope)
+    unit.scope = scope.length || isMilestone ? scope : ['.']
+    unit.acceptance = strings(unit.acceptance)
+    unit.dependsOn = strings(unit.dependsOn)
+    if (unit.ui !== undefined && unit.ui !== false && !UI_TIERS.includes(unit.ui)) delete unit.ui
   }
   const parentOf = new Map(units.filter(unit => unit.parent).map(unit => [unit.id, unit.parent]))
   const ancestorOf = id => {
     const chain = []
     let cursor = parentOf.get(id)
-    while (cursor) { chain.push(cursor); cursor = parentOf.get(cursor) }
+    while (cursor && !chain.includes(cursor)) { chain.push(cursor); cursor = parentOf.get(cursor) }
     return chain
   }
   for (const unit of units) {
+    // A milestone already waits for the units it holds, and a unit cannot wait
+    // for the milestone holding it: both deadlock without a declared cycle.
     const ancestors = new Set(ancestorOf(unit.id))
-    const descendants = new Set(units.filter(candidate => ancestorOf(candidate.id).includes(unit.id)).map(candidate => candidate.id))
-    for (const dependency of unit.dependsOn ?? []) {
-      if (dependency === unit.id) throw new Error(`unit "${unit.id}" depends on itself`)
-      if (!ids.has(dependency)) throw new Error(`unit "${unit.id}" depends on unknown unit "${dependency}"`)
-      // Both shapes below deadlock without any cycle in the declared graph: a
-      // milestone already waits for the units it holds, so asking it to wait for
-      // one of them (or asking a unit to wait for the milestone that holds it)
-      // can never be satisfied. The walk below would not see it as a cycle.
-      if (descendants.has(dependency)) {
-        throw new Error(`unit "${unit.id}" depends on "${dependency}", which is inside it: a milestone already waits for the units it contains`)
-      }
-      if (ancestors.has(dependency)) {
-        throw new Error(`unit "${unit.id}" depends on "${dependency}", which contains it: a unit cannot wait for the milestone it belongs to`)
-      }
-    }
-  }
-  for (const unit of units) {
-    if (unit.ui !== undefined && unit.ui !== false && !UI_TIERS.includes(unit.ui)) {
-      throw new Error(`unit "${unit.id}" has ui "${unit.ui}": use one of ${UI_TIERS.join(' | ')} or false`)
-    }
+    const kept = unit.dependsOn.filter(dependency => dependency !== unit.id && ids.has(dependency)
+      && !ancestors.has(dependency) && !ancestorOf(dependency).includes(unit.id))
+    if (kept.length !== unit.dependsOn.length) fixed.push(`${unit.id} 去掉了排不上的依赖：${unit.dependsOn.filter(id => !kept.includes(id)).join(', ')}`)
+    unit.dependsOn = kept
   }
   const order = topologicalOrder(units)
   if (order.length !== units.length) {
-    const stuck = units.map(unit => unit.id).filter(id => !order.includes(id))
-    throw new Error(`the plan has a dependency cycle among: ${stuck.join(', ')} — a unit can only start after its dependencies are done`)
+    const stuck = new Set(units.map(unit => unit.id).filter(id => !order.includes(id)))
+    for (const unit of units) if (stuck.has(unit.id)) unit.dependsOn = unit.dependsOn.filter(id => !stuck.has(id))
+    fixed.push(`依赖成环，拆开了：${[...stuck].join(', ')}`)
   }
-  return order
+  return { units, fixed }
+}
+
+/** The unit ids in an order they can run, after `digestUnits` repaired the plan. */
+export function validateUnits(input) {
+  return topologicalOrder(digestUnits(input).units)
 }
 
 /**
@@ -173,19 +199,19 @@ export function runnableUnits(units) {
 }
 
 export function normalizeUnits(input) {
-  validateUnits(input)
-  return flattenUnits(input).map(unit => ({
+  return digestUnits(input).units.map(unit => ({
     id: unit.id,
-    goal: unit.goal.trim(),
+    goal: unit.goal,
     // A milestone holds units instead of naming paths, so it has no scope of its
-    // own; `validateUnits` is the gate that decides when a scope is required.
-    scope: [...new Set((unit.scope ?? []).map(String))],
-    acceptance: (unit.acceptance ?? []).map(String),
-    dependsOn: [...new Set(unit.dependsOn ?? [])],
+    // own; `digestUnits` gives a leaf the whole project when it names nothing.
+    scope: [...new Set(unit.scope)],
+    acceptance: unit.acceptance,
+    dependsOn: [...new Set(unit.dependsOn)],
     deliverable: unit.deliverable ?? undefined,
-    // What kind of work the unit is. Only three values, because only three change
-    // what the host asks for at submit time (see validateSubmission).
-    kind: unit.kind === 'refactor' || unit.kind === 'verification' ? unit.kind : undefined,
+    // What kind of work the unit is. refactor and verification change what the
+    // host asks for at submit time (see validateSubmission); perf only picks the
+    // method card. Optional, never a gate: an unknown or missing kind is delivery.
+    kind: ['refactor', 'verification', 'perf', 'test', 'clarify'].includes(unit.kind) ? unit.kind : undefined,
     state: UNIT_STATES.includes(unit.state) ? unit.state : 'pending',
     // Progress notes survive a plan rewrite: `add` concatenates the old units and
     // normalizes the lot, so dropping `notes` here silently erased every

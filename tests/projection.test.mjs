@@ -163,7 +163,7 @@ test('the registration version is bumped when the fold changes', () => {
   assert.ok(BOARD_STATE_VERSION >= 2)
   const registered = []
   registerBoard({ sessionProjections: { register: definition => registered.push(definition) } })
-  assert.equal(registered[0].key, 'autoDevV3')
+  assert.equal(registered[0].key, 'dshAutoDev')
   assert.equal(registered[0].stateVersion, BOARD_STATE_VERSION)
 })
 
@@ -174,7 +174,7 @@ test('the registration is owned by the plugin and released on dispose', () => {
   const effects = []
   const definition = { dispose: () => disposed.push(true) }
   const stub = {
-    sessionProjections: { register: value => { assert.equal(value.key, 'autoDevV3'); return definition } },
+    sessionProjections: { register: value => { assert.equal(value.key, 'dshAutoDev'); return definition } },
     effect: factory => { effects.push(factory); return () => {} },
   }
   registerBoard(stub)
@@ -253,13 +253,13 @@ test('the board counts checkpoints and warnings from the host result, not the re
   const answer = (callId, value) => ({ type: 'tool/result', data: { message: { toolCallId: callId, content: [{ type: 'text', text: JSON.stringify(value) }] } } })
   const started = foldBoard(null, { type: 'tool/call', data: { callId: 'c1', name: 'work_start', arguments: JSON.stringify({ request: 'x', mode: 'do', checkpoint: { snapshot: 'captured' } }) } })
   assert.equal(started.checkpoints, 0, 'the request saying "captured" proves nothing')
-  const opened = foldBoard(started, answer('c1', { taskId: 't', checkpoint: { snapshot: 'captured', ref: 'refs/auto-dev-v3/a/1-before' } }))
+  const opened = foldBoard(started, answer('c1', { taskId: 't', checkpoint: { snapshot: 'captured', ref: 'refs/dsh-auto-dev/a/1-before' } }))
   assert.equal(opened.checkpoints, 1)
 
   const asked = foldBoard(opened, { type: 'tool/call', data: { callId: 'c2', name: 'work_submit', arguments: JSON.stringify({ outcome: 'complete', summary: 's', next: 'n' }) } })
   const settled = foldBoard(asked, answer('c2', {
     outcome: 'complete',
-    checkpoint: { snapshot: 'captured', ref: 'refs/auto-dev-v3/a/2-after' },
+    checkpoint: { snapshot: 'captured', ref: 'refs/dsh-auto-dev/a/2-after' },
     warnings: ['writes outside the declared scope (a): b'],
   }))
   const board = boardOf(settled)
@@ -285,7 +285,7 @@ test('the project band comes from the host answer, not from what was asked for',
     taskId: 't', mode: 'build', project: '/repo/report-tool', program: '让 PM 能下载周报',
     gates: { evidence: true, scope: true, authorization: true, plan: true },
     compiled: { units: 2, leaves: 2, milestones: 0, order: ['a', 'b'], verifier: { command: 'npm test', source: 'package.json scripts.test' } },
-    checkpoint: { snapshot: 'captured', ref: 'refs/auto-dev-v3/t/1-before' },
+    checkpoint: { snapshot: 'captured', ref: 'refs/dsh-auto-dev/t/1-before' },
     memory: { facts: ['这个仓库用 npm test 跑测试'], incidents: [{ symptom: 's' }, { symptom: 't' }], counts: { facts: 1, incidents: 2 } },
   }))
   const board = boardOf(opened)
@@ -296,7 +296,7 @@ test('the project band comes from the host answer, not from what was asked for',
   assert.equal(board.assets.memory.incidents, 2)
   assert.deepEqual(board.assets.memory.items, ['这个仓库用 npm test 跑测试'])
   assert.equal(board.assets.checkpoint.count, 1)
-  assert.equal(board.assets.checkpoint.ref, 'refs/auto-dev-v3/t/1-before')
+  assert.equal(board.assets.checkpoint.ref, 'refs/dsh-auto-dev/t/1-before')
   assert.deepEqual(board.gates, { evidence: true, scope: true, authorization: true, plan: true })
 })
 
@@ -306,7 +306,7 @@ test('delegated children are counted from the submission answer', () => {
   const asked = foldBoard(started, { type: 'tool/call', data: { callId: 'c1', name: 'work_submit', arguments: JSON.stringify({ outcome: 'complete', summary: 's', next: 'n' }) } })
   const settled = foldBoard(asked, answer('c1', {
     outcome: 'complete',
-    checkpoint: { snapshot: 'captured', ref: 'refs/auto-dev-v3/t/2-after' },
+    checkpoint: { snapshot: 'captured', ref: 'refs/dsh-auto-dev/t/2-after' },
     warnings: [],
     children: [{ childId: 'k1', writes: ['/repo/a.mjs', '/repo/a.test.mjs'], checks: ['cd /repo && npm test'], state: 'settled' }],
   }))
@@ -385,7 +385,7 @@ test('a refused note call leaves nothing on the board', () => {
   // The host answers a refusal with plain text, not JSON — that answer must not
   // turn into a line of progress, which is exactly how one probe call became
   // "probe" on the board.
-  const refused = foldBoard(asked, noteAnswer('c-probe', 'auto-dev-v3: task is closed'))
+  const refused = foldBoard(asked, noteAnswer('c-probe', 'dsh-auto-dev: task is closed'))
   assert.ok(!boardOf(refused).units.find(row => row.id === 'u-a').note, 'a refusal is not progress')
   const accepted = foldBoard(asked, noteAnswer('c-probe'))
   assert.equal(boardOf(accepted).units.find(row => row.id === 'u-a').note, 'probe')
@@ -685,9 +685,9 @@ test('a unit row carries its deliverable and the pair of checkpoints it earned',
   const store = storeOf(recordFor({
     task: {
       checkpoints: [
-        { ref: 'refs/auto-dev-v3/task-h/1-before', seq: 1, tag: 'before', unit: 'u1', label: '一屏能演示的渲染管线' },
-        { ref: 'refs/auto-dev-v3/task-h/2-after', seq: 2, tag: 'after', unit: 'u1', label: '一屏能演示的渲染管线', outcome: 'won' },
-        { ref: 'refs/auto-dev-v3/task-h/3-after', seq: 3, tag: 'after' },
+        { ref: 'refs/dsh-auto-dev/task-h/1-before', seq: 1, tag: 'before', unit: 'u1', label: '一屏能演示的渲染管线' },
+        { ref: 'refs/dsh-auto-dev/task-h/2-after', seq: 2, tag: 'after', unit: 'u1', label: '一屏能演示的渲染管线', outcome: 'won' },
+        { ref: 'refs/dsh-auto-dev/task-h/3-after', seq: 3, tag: 'after' },
       ],
       updatedAt: '2026-10-22T00:00:03.000Z',
     },

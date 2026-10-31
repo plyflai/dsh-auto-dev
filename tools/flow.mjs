@@ -19,7 +19,7 @@ import { apply } from '../src/index.js'
 /**
  * A stub host: enough of the cordis surface for `apply`, plus the tables the
  * plugin's record layer reads. Storage is in memory, so a run never touches
- * the real `storages/auto_dev_v3`.
+ * the real `storages/dsh_auto_dev`.
  */
 export function stubHost({ cwd = '/repo/example', tables = null } = {}) {
   const tools = new Map()
@@ -352,7 +352,7 @@ async function runScreen({ quiet = false } = {}) {
   ] })
   await call('work_plan', { taskId: started.taskId, operation: 'activate', unit: 'b1' })
   const first = await say()
-  const nudged = (first.messages ?? []).some(message => message.source?.summary === 'auto-dev-v3 ui test')
+  const nudged = (first.messages ?? []).some(message => message.source?.summary === 'dsh-auto-dev ui test')
 
   // One real browser run, then the same step again.
   await post(
@@ -361,7 +361,7 @@ async function runScreen({ quiet = false } = {}) {
     async () => ({ additionalContexts: [] }),
   )
   const second = await say()
-  const stillNudged = (second.messages ?? []).some(message => message.source?.summary === 'auto-dev-v3 ui test')
+  const stillNudged = (second.messages ?? []).some(message => message.source?.summary === 'dsh-auto-dev ui test')
 
   // A type check is real evidence, just not browser evidence: the submit should
   // still say what is missing.

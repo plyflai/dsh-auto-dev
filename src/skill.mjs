@@ -10,7 +10,7 @@ const candidate = {
   description: 'Development craft knowledge for Auto Dev tasks - how to verify, debug, judge impact, cut deliverables, interview a non-technical owner, write behaviour scenarios, do UI acceptance and release. Load when a task involves changing code and you need judgement beyond running commands.',
   invocation: { modelInvocable: true, userInvocable: true },
   source: 'bundled',
-  provider: 'auto-dev-v3',
+  provider: 'dsh-auto-dev',
   rank: 100,
   locator: SKILL_PATH,
   path: SKILL_PATH,
@@ -28,7 +28,7 @@ const candidate = {
  */
 export function installSkill(scope) {
   return scope.skills.registerProvider(() => ({
-    name: 'auto-dev-v3',
+    name: 'dsh-auto-dev',
     list: async () => [candidate],
     get: async requested => {
       if (requested.locator !== SKILL_PATH) return undefined

@@ -8,7 +8,7 @@ export const workStatus = api => (
     taskId: string, view: { type: 'string', enum: ['summary', 'executions', 'board', 'tasks'] }, limit: { type: 'integer', minimum: 1, maximum: 100 },
   }, [],
   async (args, exec) => {
-    const task = api.requireTask(api.activeTask(exec.agent) ?? api.latestTask(exec.agent), args.taskId, { allowMissing: true, agent: exec.agent })
+    const task = api.requireTask(api.activeTask(exec.agent) ?? api.latestTask(exec.agent), args.taskId)
     const view = args.view ?? 'summary'
     const limit = args.limit ?? 20
     if (view === 'executions') {

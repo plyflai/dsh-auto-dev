@@ -60,11 +60,10 @@ function formatEntry({ key, text, quote, session }) {
 export function rememberDomain(project, { kind = 'term', key = '', text = '', quote = '', session = 'this session' } = {}) {
   const section = DOMAIN_SECTIONS[kind] ? kind : 'term'
   const body = typeof text === 'string' ? text.trim() : ''
-  if (body === '') throw new Error('remember target:"domain" needs text: the term, rule or decision in one sentence.')
-  const label = typeof key === 'string' ? key.trim() : ''
-  if (section !== 'decision' && label === '') {
-    throw new Error(`remember target:"domain" kind:"${section}" needs key: the word or rule name this line is about.`)
-  }
+  if (body === '') return { stored: false, reason: '没有内容，没记' }
+  // A term or rule is looked up by its name; without one, the words before the first pause are the name.
+  const given = typeof key === 'string' ? key.trim() : ''
+  const label = given || (section === 'decision' ? '' : body.split(/[：:，,。；;（(\s]/)[0].slice(0, 20))
   const path = domainPath(project)
   const current = domainExists(project) ? readFileSync(path, 'utf8') : ''
   const line = formatEntry({ key: label, text: body, quote, session })
@@ -99,5 +98,5 @@ export function rememberDomain(project, { kind = 'term', key = '', text = '', qu
   while (tidy.length && tidy[tidy.length - 1].trim() === '') tidy.pop()
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, `${[TITLE, '', ...tidy].join('\n')}\n`, 'utf8')
-  return { path, kind: section, key: label, text: body, replaced, entries: readDomain(project).entries }
+  return { stored: true, path, kind: section, key: label, text: body, replaced, entries: readDomain(project).entries }
 }

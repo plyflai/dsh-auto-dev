@@ -5,8 +5,8 @@
 ## 计划与阶段结果
 
 - `work_start`：`request` 保留用户原话；`scope`、`acceptance` 写实际边界。`plan` 可省略，可用数组或 `{units}`。新 `build` 是 `do` 别名。
-- `work_plan`：`set/add/group/organize/activate/state/list/note/ask`。`ask` 用 `unit + text`；`done` 由验证后的提交产生。计划已存在时，不能删去未完成叶子来收尾。
-- `work_submit`：`outcome + summary + next`。证明写 `claims:[{statement,execution:{callId}}]`。从 `work_status view:executions` 找真实调用。提交后的 `waiting` 与 `continueAuthorized` 表示是否继续；普通阶段结果继续已授权工作。
+- `work_plan`：`set/add/group/organize/activate/state/list/note/ask`。`ask` 用 `unit + text`；`done` 由验证后的提交产生。单元可带可选 `kind`：`refactor`、`verification`、`perf`、`test`、`clarify`（只换方法卡）；不写就是普通交付。计划已存在时，不能删去未完成叶子来收尾。
+- `work_submit`：`outcome + summary`，其余可选。交付时插件在项目里自己跑一次项目检查（工作区自上次通过后没变就不重跑），红了才打回；修通过一个 bug 而 `.auto-dev/incidents.md` 没写，也打回一次。`claims` 只是你的说明，插件不靠它判断。提交后的 `waiting` 与 `continueAuthorized` 表示是否继续；普通阶段结果继续已授权工作。
 
 ## 普通记录
 
@@ -18,13 +18,13 @@
 | receipt | `text`，表示理解，不表示用户确认 |
 | clarify | `asked:[{question}]`（兼容 `q`）、`answers:[{q,answer}]`、`assumption` |
 | alternative | `text`；明确选择后 `verdict:kept/switched`，可附真实 `quote` |
-| learning | `text` 或 `symptom/cause/change/finding/prevention`；未知原因可省略 |
+| learning | `text` 或 `symptom/cause/change/finding/prevention/ruledOut/check/lesson`；未知原因可省略 |
 
 只记录影响目标、验收、下一步或复用的信息。真实未答问题且无继续假设、真实未选方案才等待。旧 `goal/receipt/clarify/alternative/postmortem` 入口保留；`postmortem` 现在写 memory，不再追加旧复盘文件。
 
 ## 控制与验收
 
-`pause/resume/cancel/continue` 沿用状态机。`accept/rework` 使用当前任务中真实用户原话 `text`。`pm` 完成叶子后进入 `review_ready`，不能把模型提交当人工验收。`status` 是兼容读取入口，事实与 `work_status` 相同。
+`pause/resume/cancel/continue` 沿用状态机。`accept/rework` 由交付之后用户自己的回话决定，不用抄原话；用户说了不，accept 什么都不动。`pm` 完成叶子后进入 `review_ready`，不能把模型提交当人工验收。`status` 是兼容读取入口，事实与 `work_status` 相同。
 
 ## 接手与跨机
 
@@ -39,7 +39,7 @@
 
 ## 项目知识
 
-`remember` 的 `payload.kind:fact` 用 `text`；`incident` 用 `symptom`，可附 `mechanism/repair`。未知机制保留观察；有记录的机制也须复用前核对。`target:domain` 配 `payload:{kind:term/rule/decision,key,text}` 存业务知识。
+复盘写 `.auto-dev/incidents.md`、业务口径写 `.auto-dev/project-domain.md`，用普通编辑工具即可；`remember` 仍可用，但不是必需。
 
 运行端口、命令、GUI、禁令属于 `work_env`。`observe` 只接受成功当前执行的 `callId` 或真实用户 `quote/sourceSeq`。推断用 `propose`。受保护规则的确认和撤销必须有明确用户来源；通用授权不能覆盖禁令。
 

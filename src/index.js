@@ -13,11 +13,13 @@ import { Records } from './records.mjs'
 import { collectObservations } from './session-log.mjs'
 import { DEFAULT_PROTECTED_PREFIXES } from './risk.mjs'
 import { registerBoard } from './projection.mjs'
-import { chooseProject, observedDirectory, resolveProject } from './project.mjs'
+import { resolveProject } from './project.mjs'
 import { installSkill } from './skill.mjs'
 import { installWorkTools } from './tools.mjs'
 import { childRegistry, readChildren } from './child-sessions.mjs'
 import { registerHooks } from './hooks.mjs'
+import { workStart } from './tools/start.mjs'
+import { workSubmit } from './tools/submit.mjs'
 import { createViews } from './views.mjs'
 import { createMailbox } from './mailbox.mjs'
 import { createTaskOps } from './task-ops.mjs'
@@ -29,10 +31,10 @@ import { detectVerifier } from './detect.mjs'
 import path from 'node:path'
 import { appendFileSync, statSync } from 'node:fs'
 
-// Opt-in tracing: AUTO_DEV_V3_DIAG=1 writes apply() stages to /tmp for field
+// Opt-in tracing: DSH_AUTO_DEV_DIAG=1 writes apply() stages to /tmp for field
 // diagnosis. Silent by default so a normal boot pays nothing.
 const diag = stage => {
-  if (process.env.AUTO_DEV_V3_DIAG !== '1') return
+  if (process.env.DSH_AUTO_DEV_DIAG !== '1') return
   try { appendFileSync('/tmp/dsh-auto-dev-diag.log', `${new Date().toISOString()} ${stage}\n`) } catch {}
 }
 
@@ -41,7 +43,7 @@ export { lossless }
 export const name = 'dsh-auto-dev'
 export const inject = ['tools', 'storage', 'storage.backend.json', 'workingDirectory']
 
-export const NAMESPACE = 'auto-dev-v3'
+export const NAMESPACE = 'dsh-auto-dev'
 
 /**
  * The entry schema. DSH reads the settings dialog straight out of the plugin
@@ -56,7 +58,7 @@ export const NAMESPACE = 'auto-dev-v3'
 // import node built-ins and relative files, so this mirrors the small native
 // Schemastery graph consumed by DSH without requiring a peer package at load
 // time. The graph is deliberately data-only; validation and normalization stay
-// in AUTO_DEV_V3_SCHEMA below, which is also used by the standard validator.
+// in DSH_AUTO_DEV_SCHEMA below, which is also used by the standard validator.
 function schemaNode(type, meta = {}, extra = {}) {
   const node = { type, meta, ...extra }
   // The host settings consumer walks the graph and serialises child nodes
@@ -71,13 +73,7 @@ function schemaNode(type, meta = {}, extra = {}) {
   return node
 }
 
-const scopeAdvisorySchema = schemaNode('const', { required: true }, { value: 'advisory' })
-const scopeBlockingSchema = schemaNode('const', { required: true }, { value: 'blocking' })
 const configSchema = schemaNode('object', { default: {} }, { dict: {
-  scopeEnforcement: schemaNode('union', {
-    default: 'advisory', volatile: true,
-    description: 'Whether out-of-scope writes are recorded or refused',
-  }, { list: [scopeAdvisorySchema, scopeBlockingSchema] }),
   protectedPaths: schemaNode('array', {
     default: [...DEFAULT_PROTECTED_PREFIXES], volatile: true,
     description: 'Project-relative prefixes whose modification counts as irreversible',
@@ -89,10 +85,6 @@ const configSchema = schemaNode('object', { default: {} }, { dict: {
   requireUserStart: schemaNode('boolean', {
     default: true, volatile: true,
     description: 'Require a person to authorize work_start',
-  }),
-  verificationNudgeAfter: schemaNode('number', {
-    min: 2, max: 100, step: 1, default: 5, volatile: true,
-    description: 'File-changing calls allowed without a verification check',
   }),
   narrationNudgeAfter: schemaNode('number', {
     min: 0, max: 500, step: 1, default: 30, volatile: true,
@@ -125,7 +117,7 @@ function serialiseSchema(root) {
 }
 
 function validateConfig(value) {
-  try { return { value: AUTO_DEV_V3_SCHEMA(plain(value)) } } catch (error) {
+  try { return { value: DSH_AUTO_DEV_SCHEMA(plain(value)) } } catch (error) {
     return { issues: [{ message: error instanceof Error ? error.message : String(error) }] }
   }
 }
@@ -139,49 +131,39 @@ export const Config = Object.assign(configSchema, {
 /** Bound a notice summary the same way the host bounds its own context summaries. */
 
 export const DEFAULT_CONFIG = {
-  scopeEnforcement: 'advisory',
   protectedPaths: DEFAULT_PROTECTED_PREFIXES,
   autoEnroll: false,
   requireUserStart: true,
-  verificationNudgeAfter: 5,
   narrationNudgeAfter: 30,
   checkpoints: true,
 }
 
 /**
- * The settings section. `scopeEnforcement` is the one field a person is likely
- * to change while working, so it is volatile (live); the rest describe how this
- * repository is treated and are read by the gates on every call.
+ * The settings section. Fields are volatile (live) and describe how this
+ * repository is treated; a field no code reads any more is removed, not kept
+ * as a switch that does nothing. Unknown keys in a stored config are ignored.
  */
-export function AUTO_DEV_V3_SCHEMA(value) {
+export function DSH_AUTO_DEV_SCHEMA(value) {
   const raw = value === undefined || value === null ? {} : value
   if (Array.isArray(raw) || typeof raw !== 'object') throw new TypeError('dsh-auto-dev: expected an object')
-  const scopeEnforcement = raw.scopeEnforcement ?? DEFAULT_CONFIG.scopeEnforcement
-  if (!['advisory', 'blocking'].includes(scopeEnforcement)) throw new TypeError('dsh-auto-dev: scopeEnforcement must be "advisory" or "blocking"')
   const protectedPaths = raw.protectedPaths === undefined ? DEFAULT_CONFIG.protectedPaths : raw.protectedPaths
   if (!Array.isArray(protectedPaths) || protectedPaths.some(entry => typeof entry !== 'string')) throw new TypeError('dsh-auto-dev: protectedPaths must be an array of strings')
   const autoEnroll = raw.autoEnroll ?? DEFAULT_CONFIG.autoEnroll
   if (typeof autoEnroll !== 'boolean') throw new TypeError('dsh-auto-dev: autoEnroll must be boolean')
   const requireUserStart = raw.requireUserStart ?? DEFAULT_CONFIG.requireUserStart
   if (typeof requireUserStart !== 'boolean') throw new TypeError('dsh-auto-dev: requireUserStart must be boolean')
-  const verificationNudgeAfter = raw.verificationNudgeAfter ?? DEFAULT_CONFIG.verificationNudgeAfter
-  if (!Number.isInteger(verificationNudgeAfter) || verificationNudgeAfter < 2 || verificationNudgeAfter > 100) {
-    throw new TypeError('dsh-auto-dev: verificationNudgeAfter must be an integer between 2 and 100')
-  }
   const narrationNudgeAfter = raw.narrationNudgeAfter ?? DEFAULT_CONFIG.narrationNudgeAfter
   if (!Number.isInteger(narrationNudgeAfter) || narrationNudgeAfter < 0 || narrationNudgeAfter > 500) {
     throw new TypeError('dsh-auto-dev: narrationNudgeAfter must be an integer between 0 and 500')
   }
   const checkpoints = raw.checkpoints ?? DEFAULT_CONFIG.checkpoints
   if (typeof checkpoints !== 'boolean') throw new TypeError('dsh-auto-dev: checkpoints must be boolean')
-  return { scopeEnforcement, protectedPaths, autoEnroll, requireUserStart, verificationNudgeAfter, narrationNudgeAfter, checkpoints }
+  return { protectedPaths, autoEnroll, requireUserStart, narrationNudgeAfter, checkpoints }
 }
 
-AUTO_DEV_V3_SCHEMA.toJSON = () => ({
+DSH_AUTO_DEV_SCHEMA.toJSON = () => ({
   type: 'object',
   properties: {
-    scopeEnforcement: { type: 'string', enum: ['advisory', 'blocking'], default: DEFAULT_CONFIG.scopeEnforcement,
-      description: 'advisory records writes outside the declared scope; blocking refuses the submission' },
     protectedPaths: { type: 'array', items: { type: 'string' }, default: DEFAULT_CONFIG.protectedPaths,
       description: 'Project-relative prefixes whose modification counts as an irreversible action' },
     autoEnroll: { type: 'boolean', default: DEFAULT_CONFIG.autoEnroll,
@@ -189,9 +171,7 @@ AUTO_DEV_V3_SCHEMA.toJSON = () => ({
     requireUserStart: { type: 'boolean', default: DEFAULT_CONFIG.requireUserStart,
       description: 'Tasks may only be started by a person: work_start is refused until they issue /dsh-auto-dev start with their own words' },
     checkpoints: { type: 'boolean', default: DEFAULT_CONFIG.checkpoints,
-      description: 'Write auto-dev-v3/ck/* snapshot refs before and after a task' },
-    verificationNudgeAfter: { type: 'integer', minimum: 2, maximum: 100, default: DEFAULT_CONFIG.verificationNudgeAfter,
-      description: 'How many file-changing calls may pass without a check before the host reminds the model' },
+      description: 'Write dsh-auto-dev/ck/* snapshot refs before and after a task' },
     narrationNudgeAfter: { type: 'integer', minimum: 0, maximum: 500, default: DEFAULT_CONFIG.narrationNudgeAfter,
       description: 'How many steps may pass without visible words to the user before the host reminds the model to report progress; 0 turns the reminder off' },
   },
@@ -215,7 +195,7 @@ function plain(value) {
 
 export function readConfig(value) {
   if (value === undefined || value === null) return { ...DEFAULT_CONFIG }
-  return AUTO_DEV_V3_SCHEMA(plain(value))
+  return DSH_AUTO_DEV_SCHEMA(plain(value))
 }
 
 export async function apply(ctx, config) {
@@ -288,25 +268,10 @@ async function applyInner(ctx, config) {
   // subagents, and falling back to the host's process.cwd() silently scoped a
   // delivery in /tmp to the harness checkout (found by the first end-to-end run).
   /**
-   * What this session's own shell last worked in, when it can be observed. The
-   * session metadata answers with the parent's directory inside a subagent, so the
-   * commands that really ran are consulted first — and their `cd` targets only
-   * survive this filter while the directory still exists.
+   * The root a new task should use: what the host says this session's directory is.
+   * A `cd` in a command is never read as a different project (设计约定「第三条路」).
    */
-  const observedSoFar = agent => {
-    const from = Math.max(0, (agent?.session?.seq ?? 0) - 400)
-    try { return collectObservations(agent.session, from) } catch { return undefined }
-  }
-  /**
-   * The root a new task should use. The metadata answer stands unless the shell
-   * that actually ran is demonstrably more specific about the declared scope.
-   */
-  const projectOf = (agent, scope) => {
-    const base = resolveProject(agent, ctx)
-    let observed
-    try { observed = observedDirectory(observedSoFar(agent)) } catch { observed = undefined }
-    return chooseProject({ base, observed, scope })
-  }
+  const projectOf = agent => resolveProject(agent, ctx)
 
   /**
    * A directory the caller named, or a refusal. Silently falling back to the
@@ -320,11 +285,11 @@ async function applyInner(ctx, config) {
     return resolved
   }
 
-  const { checkpointView, gatesFor, assertPlan, compileReport, planView, assertLeaf, boardView, statusView } =
+  const { checkpointView, gatesFor, assertPlan, compileReport, planView, leafOf, boardView, statusView } =
     createViews({ records, timelineForProject })
   const { notice, queueNotice, blockedOnce, takeOutbox, queueReceipt, takeReceipts, intake, takeIntake, grantStart, readStartGrant, consumeStartGrant } =
     createMailbox({ sessionState, sessionId })
-  const { proposeOrganize, slugOf, snapshot, newId, exportSnapshot, importSnapshot, unfinishedElsewhere, adoptTask, requireTask, setUnits } =
+  const { proposeOrganize, slugOf, snapshot, newId, exportSnapshot, importSnapshot, unfinishedElsewhere, adoptTask, requireTask, noTask, setUnits } =
     createTaskOps({ records, settings, sessionState, sessionId, seq, projectOf, planOf, latestTask, planView, checkpointView })
 
   // `agents` is not a declared dependency: cordis resolves an optional lookup
@@ -356,8 +321,8 @@ async function applyInner(ctx, config) {
   }
   const toolApi = () => ({
     records, settings, sessionState, sessionId, seq, nudged, observationsOf, projectOf, assertDirectory, detectVerifier,
-    planOf, activeTask, latestTask, watchedTask, requireTask,
-    newId, slugOf, snapshot, checkpointView, setUnits, assertPlan, assertLeaf, gatesFor, compileReport,
+    planOf, activeTask, latestTask, watchedTask, requireTask, noTask,
+    newId, slugOf, snapshot, checkpointView, setUnits, assertPlan, leafOf, gatesFor, compileReport,
     planView, boardView, statusView, proposeOrganize, adoptTask, exportSnapshot, importSnapshot,
     queueNotice, blockedOnce, consumeStartGrant, childWork,
   })
@@ -373,7 +338,11 @@ async function applyInner(ctx, config) {
   const hookApi = () => ({
     records, settings, sessionState, sessionId, seq, nudged, denied, observationsOf, projectOf, newId,
     planOf, activeTask, latestTask, stoppedTask, optedIn, markUserSpoke, unfinishedElsewhere,
-    notice, takeOutbox, takeReceipts, takeIntake, grantStart, readStartGrant, blockedOnce,
+    notice, takeOutbox, queueReceipt, takeReceipts, takeIntake, grantStart, readStartGrant, blockedOnce, snapshot,
+    // The user's start is the registration: it spends the grant, so the model never fills a form to begin.
+    startTask: (agent, request) => workStart(toolApi())[4]({ request }, { agent, callId: 'dsh-auto-dev-start' }),
+    // The model saying it is done is the hand-in; G1 still decides. Same path as work_submit.
+    handIn: (agent, summary) => workSubmit(toolApi())[4]({ outcome: 'complete', summary }, { agent, callId: 'dsh-auto-dev-settle' }),
   })
 
   // Registration happens last, once every helper above is initialised: the tool

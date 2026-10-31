@@ -32,6 +32,37 @@ async function git(project, args, { allowFailure = false } = {}) {
   }
 }
 
+/** The last few commits with the files they touched; empty outside a repository. */
+export async function recentCommits(project, count = 5) {
+  if (typeof project !== 'string' || project === '') return []
+  const listed = await git(project, ['log', `-${count}`, '--name-only', '--format=%x00%h %s'], { allowFailure: true })
+  if (!listed.ok) return []
+  return listed.out.split('\0').map(chunk => chunk.trim()).filter(Boolean).map(chunk => {
+    const [head, ...files] = chunk.split('\n').map(line => line.trim()).filter(Boolean)
+    return { head, files }
+  })
+}
+
+/**
+ * Files still naming what was deleted: `git grep -w` on each path's stem, in
+ * tracked files. Empty outside a repository or for a stem too short to mean anything.
+ */
+export async function referencesTo(project, paths = []) {
+  if (typeof project !== 'string' || project === '') return []
+  const found = []
+  for (const path of paths.slice(0, 5)) {
+    const base = path.split('/').pop() ?? ''
+    const stem = base.replace(/\.[^.]+$/, '')
+    if (stem.length < 3 || /^(index|main|test|tests|src|lib|utils?)$/i.test(stem)) continue
+    const listed = await git(project, ['grep', '-l', '-w', '-F', '-e', stem], { allowFailure: true })
+    if (!listed.ok) continue
+    for (const file of listed.out.split('\n').map(line => line.trim()).filter(Boolean)) {
+      if (!path.endsWith(file) && !found.some(row => row.file === file)) found.push({ file, name: stem })
+    }
+  }
+  return found
+}
+
 /**
  * Capture the current working tree of `project` under a checkpoint ref.
  *
@@ -53,7 +84,7 @@ export async function captureCheckpoint(project, { slug, tag, seq }) {
   if (!created.ok) return { ok: false, skipped: `checkpoint failed: ${created.reason}` }
   if (created.out === '') return { ok: false, skipped: 'no writes since the last commit' }
   const commit = created.out
-  const ref = `refs/auto-dev-v3/${slug}/${seq}-${tag}`
+  const ref = `refs/dsh-auto-dev/${slug}/${seq}-${tag}`
   const written = await git(project, ['update-ref', ref, commit], { allowFailure: true })
   if (!written.ok) return { ok: false, skipped: `checkpoint failed: ${written.reason}` }
   return { ok: true, ref, commit, at: new Date().toISOString() }
@@ -87,14 +118,14 @@ export async function restoreCheckpoint(project, commit) {
  * @returns {Promise<Array<{ref: string, commit: string, seq: string, tag: string}>>}
  */
 export async function listCheckpoints(project, slug) {
-  const listed = await git(project, ['for-each-ref', '--format=%(refname) %(objectname)', `refs/auto-dev-v3/${slug}/`], { allowFailure: true })
+  const listed = await git(project, ['for-each-ref', '--format=%(refname) %(objectname)', `refs/dsh-auto-dev/${slug}/`], { allowFailure: true })
   if (!listed.ok) return []
   return listed.out
     .split('\n')
     .filter(Boolean)
     .map(line => {
       const [ref, commit] = line.split(' ')
-      const tail = ref.slice(`refs/auto-dev-v3/${slug}/`.length)
+      const tail = ref.slice(`refs/dsh-auto-dev/${slug}/`.length)
       const dash = tail.lastIndexOf('-')
       return { ref, commit, seq: tail.slice(0, dash), tag: tail.slice(dash + 1) }
     })
@@ -123,4 +154,32 @@ export async function rotateCheckpoints(project, slug, keep = 5) {
     if (removed.ok) dropped += 1
   }
   return dropped
+}
+
+/** Saves of how many tasks stay in the repository (设计约定 大原则 8：有存就有退役). */
+export const KEEP_TASKS = 3
+
+/**
+ * Retire the saves of all but the newest `keep` tasks, by the time of each task's
+ * newest save. The task `current` is never retired. Returns the refs removed.
+ */
+export async function retireCheckpoints(project, { keep = KEEP_TASKS, current } = {}) {
+  const listed = await git(project, ['for-each-ref', '--sort=-committerdate', '--format=%(refname)', 'refs/dsh-auto-dev/'], { allowFailure: true })
+  if (!listed.ok) return []
+  const order = []
+  const refs = new Map()
+  for (const ref of listed.out.split('\n').filter(Boolean)) {
+    const slug = ref.slice('refs/dsh-auto-dev/'.length).split('/')[0]
+    if (!refs.has(slug)) { refs.set(slug, []); order.push(slug) }
+    refs.get(slug).push(ref)
+  }
+  const kept = new Set([current, ...order.filter(slug => slug !== current).slice(0, Math.max(0, keep - (current && refs.has(current) ? 1 : 0)))])
+  const removed = []
+  for (const slug of order) {
+    if (kept.has(slug)) continue
+    for (const ref of refs.get(slug)) {
+      if ((await git(project, ['update-ref', '-d', ref], { allowFailure: true })).ok) removed.push(ref)
+    }
+  }
+  return removed
 }

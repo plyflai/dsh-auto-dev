@@ -10,7 +10,7 @@ import { lossless } from './json.mjs'
 const CONTEXT_SUMMARY_MAX_CHARS = 120
 
 /** The `source.kind` every queued notice carries; the browser half claims cards by it. */
-export const NOTICE_KIND = 'auto-dev-v3'
+export const NOTICE_KIND = 'dsh-auto-dev'
 
 export function createMailbox({ sessionState, sessionId }) {
   const intake = new Map()
@@ -54,7 +54,7 @@ export function createMailbox({ sessionState, sessionId }) {
   const blockedOnce = (agent, key, { unit, title, line }) => {
     if (!agent || blocked.has(key)) return
     blocked.add(key)
-    queueNotice(agent, `**${title}** — ${line}`, `auto-dev-v3 blocked ${key}`,
+    queueNotice(agent, `**${title}** — ${line}`, `dsh-auto-dev blocked ${key}`,
       { form: 'blocked-call', data: { ...(unit ? { unit } : {}), title, line, tone: 'guard' } })
   }
   const takeOutbox = agent => (agent ? outbox(agent).splice(0) : [])

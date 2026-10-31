@@ -6,7 +6,7 @@ staged=$(git diff --cached --name-only --diff-filter=ACMR)
 if ! printf '%s\n' "$staged" | grep -Eq '^(src/|tests/|tools/|package\.json$)'; then
   exit 0
 fi
-echo "auto-dev-v3: 改动涉及 src/tests/tools —— 跑一遍检查台（npm run check）…"
+echo "dsh-auto-dev: 改动涉及 src/tests/tools —— 跑一遍检查台（npm run check）…"
 # git 给钩子注入的 GIT_INDEX_FILE 等会漏进测试里的临时仓库（commit -a 时指向临时索引）
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE GIT_PREFIX
 if ! npm run --silent check; then

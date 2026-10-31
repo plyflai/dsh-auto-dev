@@ -6,7 +6,7 @@
 import { createTaskRecord, MODES, text } from './task.mjs'
 import { executionSummary } from './session-log.mjs'
 import { leafUnits, normalizeUnits } from './plan.mjs'
-import { captureCheckpoint, rotateCheckpoints } from './checkpoint.mjs'
+import { captureCheckpoint, retireCheckpoints, rotateCheckpoints } from './checkpoint.mjs'
 import { heldSessions, newestFirst } from './lookup.mjs'
 
 export function createTaskOps({ records, settings, sessionState, sessionId, seq, projectOf, planOf, latestTask, planView, checkpointView }) {
@@ -22,7 +22,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
    */
   const proposeOrganize = async (task, agent) => {
     const plan = planOf(task)
-    if (!plan) throw new Error(`task ${task.id} has no plan yet — there is nothing to organize`)
+    if (!plan) return null
     const rows = plan.units ?? []
     const daily = rows.filter(row => row.parent === 'daily').map(row => row.id)
     const themes = rows
@@ -47,7 +47,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
     // Honour the setting: someone who turned checkpoints off should not find
     // refs in their repository anyway.
     if (settings().checkpoints === false) {
-      return { snapshot: 'skipped', reason: 'checkpoints are disabled in the auto-dev-v3 settings' }
+      return { snapshot: 'skipped', reason: 'checkpoints are disabled in the dsh-auto-dev settings' }
     }
     const seq = (task.checkpoints ?? []).length + 1
     const captured = await captureCheckpoint(task.project, { slug: slugOf(task), tag, seq })
@@ -76,6 +76,8 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
       // one more round, which is not worth failing a submit over.
       try { await rotateCheckpoints(task.project, slugOf(task), 5) } catch { /* the refs are still usable */ }
     }
+    // Older tasks' saves retire once this one has its own (大原则 8).
+    try { await retireCheckpoints(task.project, { current: slugOf(task) }) } catch { /* housekeeping */ }
     return { snapshot: 'captured', ref: captured.ref, commit: captured.commit, seq }
   }
   // Ids order by creation: the time part never repeats inside this process, so two
@@ -96,7 +98,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
   function exportSnapshot(task, observations) {
     const plan = planOf(task)
     return {
-      format: 'auto-dev-v3/export@1',
+      format: 'dsh-auto-dev/export@1',
       exportedAt: new Date().toISOString(),
       task: {
         id: task.id, project: task.project, mode: task.mode, state: task.state,
@@ -138,20 +140,18 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
    */
   async function importSnapshot(args, agent) {
     const payload = args.payload
-    if (!payload || typeof payload !== 'object') {
-      throw new Error('import needs payload: pass the object returned by work_control operation "export"')
-    }
-    if (payload.format !== 'auto-dev-v3/export@1' || !payload.task || typeof payload.task !== 'object') {
-      throw new Error('payload is not an auto-dev-v3 export (expected format "auto-dev-v3/export@1" with a task)')
+    // Anything but an export of ours is answered, not refused: there is simply nothing to bring in.
+    if (!payload || typeof payload !== 'object' || payload.format !== 'dsh-auto-dev/export@1' || !payload.task || typeof payload.task !== 'object') {
+      return { imported: false, tellUser: '这不是一份 dsh-auto-dev 导出，没导入。' }
     }
     const incoming = payload.task
     const now = new Date().toISOString()
     const task = createTaskRecord({
       id: newId('task'),
-      project: text(typeof incoming.project === 'string' ? incoming.project : projectOf(agent), 'project', { max: 400 }),
+      project: text(typeof incoming.project === 'string' ? incoming.project : projectOf(agent), 400),
       sessionId: agent?.session?.id,
       ownerId: agent?.id,
-      request: text(typeof incoming.request === 'string' ? incoming.request : '(imported task)', 'request'),
+      request: text(typeof incoming.request === 'string' ? incoming.request : '(imported task)'),
       goal: typeof incoming.goal === 'string' ? incoming.goal : undefined,
       mode: MODES.includes(incoming.mode) ? incoming.mode : 'do',
       scope: Array.isArray(incoming.scope) && incoming.scope.length ? incoming.scope : ['.'],
@@ -227,11 +227,14 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
    */
   async function adoptTask(args, agent) {
     const taskId = typeof args.taskId === 'string' ? args.taskId.trim() : ''
-    if (!taskId) throw new Error('adopt needs taskId: work_status view "tasks" lists what this project has')
+    // What cannot be adopted is answered with what can, never refused.
+    const waiting = unfinishedElsewhere(agent).map(row => row.id)
+    const none = line => ({ adopted: false, tellUser: `${line}${waiting.length ? `可以接手的：${waiting.join('、')}。` : ''}` })
+    if (!taskId) return none('没说接手哪一条。')
     const found = records.get('tasks', taskId)
-    if (!found) throw new Error(`task ${taskId} does not exist on this host — work_status view "tasks" lists this project's tasks`)
-    if (found.state === 'cancelled') throw new Error(`task ${taskId} is cancelled: start a new task with work_start instead`)
-    if (found.state === 'review_ready') throw new Error('task is awaiting review: use work_control accept/rework before adopting it as active work')
+    if (!found) return none(`这里没有任务 ${taskId}。`)
+    if (found.state === 'cancelled') return none(`${taskId} 已取消，要做就让用户重新 /dsh-auto-dev start。`)
+    if (found.state === 'review_ready') return none(`${taskId} 在等用户验收：用户说可以就收案，说哪里不对就退回改。`)
     const from = found.sessionId
     const now = new Date().toISOString()
     if (from === sessionId(agent) && found.state !== 'closed') {
@@ -296,50 +299,62 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
     return typeof seq === 'number' ? seq : 0
   }
 
-  function requireTask(task, taskId, { allowMissing = false, agent } = {}) {
-    if (taskId) {
-      const found = records.get('tasks', taskId)
-      if (!found) throw new Error(`task ${taskId} does not exist`)
-      return found
-    }
-    if (!task && !allowMissing) {
-      const known = agent ? latestTask(agent) : undefined
-      throw new Error(known && known.state === 'closed'
-        ? `task ${known.id} is closed — explicitly adopt it for a new evidence window, or start a new task with work_start`
-        : 'no task in this session: call work_start first')
-    }
-    return task
+  // A taskId that names nothing is a typo, not a request for another task: use this session's.
+  function requireTask(task, taskId) {
+    return (taskId ? records.get('tasks', taskId) : undefined) ?? task
+  }
+
+  /** The answer a work_* call gets when this session has no task: the user opens one, not the model. */
+  function noTask(agent) {
+    const known = agent ? latestTask(agent) : undefined
+    return { task: null, waiting: 'user-start',
+      tellUser: known?.state === 'closed'
+        ? `上一个任务 ${known.id} 已经收尾。要接着做，请用户 /dsh-auto-dev adopt ${known.id}；要做新的，请用户 /dsh-auto-dev start <要做的事>。`
+        : '这个会话还没有任务：任务由用户用 /dsh-auto-dev start <要做的事> 开，先照常回答用户。' }
   }
 
   async function setUnits(taskId, units) {
     const now = new Date().toISOString()
     const task = records.get('tasks', taskId)
     const prior = planOf(task)?.units ?? []
-    const normalized = normalizeUnits(units ?? []).map(unit => {
+    let normalized = normalizeUnits(units ?? []).map(unit => {
       const old = prior.find(row => row.id === unit.id)
       return { ...unit, ...(Number.isInteger(old?.startedSeq) ? { startedSeq: old.startedSeq } : {}),
         ...(old?.startedAt ? { startedAt: old.startedAt } : {}) }
     })
-    const nextLeaves = new Set(leafUnits(normalized).map(unit => unit.id))
-    for (const unit of leafUnits(prior).filter(row => row.state !== 'done')) {
-      if (!nextLeaves.has(unit.id)) throw new Error(`plan cannot remove unfinished leaf ${unit.id} or turn it into a container: retain it and use state dropped with the person's approval for scope reduction`)
-    }
-    // Grouping moves a verified leaf without changing the work it proved.
+    // Only a submission makes a unit done. Grouping may move a verified leaf without
+    // changing the work it proved; anything else written as done goes back to waiting.
     const priorLeaves = new Set(leafUnits(prior).map(unit => unit.id))
     const definition = unit => JSON.stringify([unit.goal, unit.scope, unit.acceptance, unit.dependsOn ?? [], unit.deliverable ?? null, unit.kind ?? 'delivery', unit.ui ?? null])
-    for (const unit of normalized.filter(row => row.state === 'done')) {
+    const leavesOf = rows => new Set(leafUnits(rows).map(unit => unit.id))
+    let nextLeaves = leavesOf(normalized)
+    const reopened = []
+    normalized = normalized.map(unit => {
+      if (unit.state !== 'done') return unit
       const old = prior.find(row => row.id === unit.id)
-      if (old?.state !== 'done' || priorLeaves.has(unit.id) !== nextLeaves.has(unit.id) || definition(old) !== definition(unit)) throw new Error(`plan cannot inject done unit ${unit.id}: use work_submit with real execution evidence`)
+      if (old?.state === 'done' && priorLeaves.has(unit.id) === nextLeaves.has(unit.id) && definition(old) === definition(unit)) return unit
+      reopened.push(unit.id)
+      return { ...unit, state: old?.state && old.state !== 'done' ? old.state : 'pending' }
+    })
+    // An unfinished leaf never disappears in a rewrite: it stays, dropped, and the
+    // person hears about it — a quietly shrunk plan is the drift this guards.
+    const kept = leafUnits(prior).filter(row => row.state !== 'done' && !normalized.some(unit => unit.id === row.id))
+    const vanished = kept.filter(row => row.state !== 'dropped')
+    normalized = [...normalized, ...kept.map(row => ({ ...row, state: 'dropped' }))]
+    nextLeaves = leavesOf(normalized)
+    const digested = {
+      ...(reopened.length ? { reopened } : {}),
+      ...(vanished.length ? { dropped: vanished.map(row => row.id), tellUser: `计划里拿掉了没做完的 ${vanished.map(row => `${row.id}（${row.goal}）`).join('、')}：已记为不做了。给用户一句为什么不做。` } : {}),
     }
     if (task.planId) {
       const updated = await records.change('plans', task.planId, current => ({ ...current, units: normalized, updatedAt: now }))
-      return planView(records.get('tasks', taskId), updated)
+      return { ...planView(records.get('tasks', taskId), updated), ...digested }
     }
     const plan = { id: newId('plan'), version: 1, project: task.project, taskId, units: normalized, createdAt: now, updatedAt: now }
     await records.change('plans', plan.id, () => plan)
     await records.change('tasks', taskId, current => ({ ...current, planId: plan.id, updatedAt: now }))
-    return planView(records.get('tasks', taskId), plan)
+    return { ...planView(records.get('tasks', taskId), plan), ...digested }
   }
 
-  return { proposeOrganize, slugOf, snapshot, newId, exportSnapshot, importSnapshot, unfinishedElsewhere, adoptTask, observationsStart, requireTask, setUnits }
+  return { proposeOrganize, slugOf, snapshot, newId, exportSnapshot, importSnapshot, unfinishedElsewhere, adoptTask, observationsStart, requireTask, noTask, setUnits }
 }

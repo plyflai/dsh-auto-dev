@@ -24,7 +24,8 @@
     "cordis.patch.yml",
     "BEYOND.md",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "README.zh-CN.md"
   ],
   "engines": {
     "node": ">=20"
@@ -44,13 +45,14 @@
     }
   },
   "scripts": {
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --import ./tests/env.mjs --test tests/*.test.mjs",
     "build:client": "node scripts/build-client.mjs",
     "flow": "node tools/flow.mjs",
-    "check": "node --test tests/*.test.mjs && node tools/scenarios.mjs",
+    "check": "node --import ./tests/env.mjs --test tests/*.test.mjs && node tools/scenarios.mjs",
     "hooks:install": "node tools/install-hooks.mjs",
     "bench": "node tools/scenarios.mjs",
-    "perf": "node tools/perf.mjs"
+    "perf": "node tools/perf.mjs",
+    "replay": "node tools/replay.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.28.2"

@@ -34,8 +34,7 @@ export function createViews({ records, timelineForProject }) {
    * what keeps a rejected `work_start` from leaving an active task with no units.
    */
   function assertPlan(units) {
-    validateUnits(flattenUnits(normalizeUnits(units ?? [])))
-    if (flattenUnits(units ?? []).some(unit => unit.state === 'done')) throw new Error('initial plan cannot contain done units: submit real checks through work_submit')
+    validateUnits(units ?? [])
     return true
   }
 
@@ -101,15 +100,16 @@ export function createViews({ records, timelineForProject }) {
     return nextUnit({ ...plan, units: projected })
   }
 
-  /** Milestones are containers: no leaf work, no state of their own. */
-  function assertLeaf(plan, unitId) {
+  /**
+   * The leaf a unit id means. Milestones are containers with no work of their own, so
+   * naming one means its active leaf, else its next unfinished one, else its first.
+   */
+  function leafOf(plan, unitId) {
     const unit = plan.units.find(entry => entry.id === unitId)
-    if (!unit) return undefined
     const children = plan.units.filter(entry => entry.parent === unitId)
-    if (children.length > 0) {
-      throw new Error(`unit "${unitId}" is a milestone holding ${children.length} unit(s) (${children.map(child => child.id).join(', ')}): activate one of those, not the milestone — a milestone finishes when they do`)
-    }
-    return unit
+    if (!unit || children.length === 0) return unit
+    const open = children.filter(child => !['done', 'dropped'].includes(child.state))
+    return leafOf(plan, (open.find(child => child.state === 'active') ?? open[0] ?? children[0]).id)
   }
 
   function boardView(task, plan, decisions) {
@@ -141,5 +141,5 @@ export function createViews({ records, timelineForProject }) {
     }
   }
 
-  return { checkpointView, gatesFor, assertPlan, compileReport, planView, nextUnitAfter, assertLeaf, boardView, statusView }
+  return { checkpointView, gatesFor, assertPlan, compileReport, planView, nextUnitAfter, leafOf, boardView, statusView }
 }

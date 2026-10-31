@@ -1,69 +1,146 @@
 # dsh-auto-dev
 
-DeepSeek Harness 的 Auto Dev 插件。模型负责实现与排查；插件把真实执行、人工决定和任务记录投影到对话回执、dock 与右侧面板。插件不接管宿主的代理或工作树调度。
+**Your production-grade dev team for DeepSeek Harness.**
 
-## 安装
+Vibe coding makes fast fashion: use it once, throw it away. dsh-auto-dev ships products you can launch and maintain.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**English** · [简体中文](./README.zh-CN.md)
+
+**Targets the Web UI of [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 0.2.1-rc.1.**
+
+![A finished task: the delivery report on the left, the dev progress board on the right](docs/images/hero.png)
+
+## Why not just vibe code
+
+### 1. Full-stack dev team: one request covers frontend, backend, database and tests
+- **Vibe coding:** one model writes code; you babysit everything else.
+- **dsh-auto-dev:** a whole dev team. Production-grade results, no coding skills required.
+
+### 2. Test-driven delivery: a product you can launch, not a one-off demo
+- **Vibe coding:** works in the demo, breaks on real data.
+- **dsh-auto-dev:** best practices, fully tested, reproducible and stable.
+
+### 3. Senior engineering playbook: senior experience, every time
+- **Vibe coding:** quality depends on the model's mood that day.
+- **dsh-auto-dev:** debugging, review, release, plus best practices for major languages and platforms — the right method for each situation.
+
+### 4. Cross-session task state: days of work, many chats, nothing lost
+- **Vibe coding:** long chats forget; every new chat starts from zero.
+- **dsh-auto-dev:** switch chats, come back tomorrow, hand it to a teammate — pick up where you left off.
+
+### 5. Dev progress UI: see where things stand, skip the essays
+- **Vibe coding:** scroll through hundreds of lines to guess how far it got.
+- **dsh-auto-dev:** one board — what's done, what's left, what's waiting on you.
+
+### 6. Project knowledge base: it gets to know your project
+- **Vibe coding:** every chat is a first meeting; the same pitfall, ten times.
+- **dsh-auto-dev:** pitfalls, environment and business rules are recorded automatically and reused next time.
+
+### 7. Requirement clarification: it asks before it guesses
+- **Vibe coding:** starts on a one-liner, builds the wrong thing.
+- **dsh-auto-dev:** asks two or three questions on business-critical points; decides technical details itself.
+
+### 8. Rolling Git checkpoints: save before every boss fight
+- **Vibe coding:** one slip and your code is gone.
+- **dsh-auto-dev:** saves before big changes and after tests pass; roll back anytime. Deleting data or deploying always asks you first.
+
+## Install
 
 ```sh
-git clone <本仓库地址> dsh-auto-dev
+git clone https://github.com/plyflai/dsh-auto-dev.git
 dsh plugin --profile <profile> add ./dsh-auto-dev
 ```
 
-无运行时依赖；客户端包 `lib/client.js` 已随仓库提交，无需构建。安装后重启宿主。
+Restart DSH afterwards. No runtime dependencies; works out of the box.
 
-## 使用
+## Quick start
 
-安装或修改 host 源码后重启宿主。改客户端需 `npm install` 后 `npm run build:client`，再刷新页面。用户在会话中运行 `/dsh-auto-dev start <需求>` 即授权开始；`work_start` 登记该请求，不重复索取同意。`start` 可接手项目未完成任务；明确另开任务用 `new`。未启用的会话不挂载工具与工艺提示。
+In any chat, start with `/dsh-auto-dev` and say what you want:
 
-默认模式为 `do`，计划按需建立。新输入 `build` 归一为 `do`；历史 `build` 保留原值并按 `do` 解释。`look` 表示查看意图，不代表完整写入沙箱。`auto` / `pm` 验收独立于模式。
+```
+/dsh-auto-dev add a search command to the notes CLI. Done when `notes search milk` finds "buy milk".
+```
 
-## 七个工具
+That's it. Planning, coding, testing and delivery are on it; when a decision is yours, it stops and asks.
 
-| 入口 | 产出 |
+Continuing tomorrow in a new chat:
+
+```
+/dsh-auto-dev adopt
+```
+
+Chats that never use `/dsh-auto-dev` are left completely alone.
+
+## Dev progress UI
+
+![Receipts in the conversation](docs/images/conversation.png)
+
+- **Receipts**: a card in the chat at every milestone — started, unit done, blocked, waiting for you, delivered.
+- **Dock**: one line above the input — how far the task is and whether it needs you.
+- **Board**: the *Auto Dev* right panel — goal, acceptance criteria, what is still unverified, the latest result, the engineering log.
+
+## Commands
+
+| Command | |
 | --- | --- |
-| `work_start` | 请求、范围、验收、环境与项目知识摘要 |
-| `work_plan` | 可选单元、依赖、分组、当前叶子与备注 |
-| `work_submit` | 关联真实执行的阶段结果；继续工作或返回真实等待 |
-| `work_status` | summary / executions / board / tasks；执行证据的 callId 来自 executions |
-| `work_control` | 控制、record、人工验收、接手、导入导出、快照和知识记录 |
-| `work_extend` | 绑定当前任务与具体动作的真实人工决定 |
-| `work_env` | 有来源的环境观测、候选、失效与受保护规则 |
+| `start <request>` | Start work, or pick up this project's unfinished task |
+| `new <request>` | Always open a new task |
+| `status` | Current task, progress, what is pending |
+| `tasks` | Recent tasks in this project |
+| `adopt [taskId]` | Continue a task from another chat |
+| `pause` · `resume` · `cancel` | Change the task's state |
+| `organize` | Propose a cleanup of a long plan; nothing changes until you agree |
+| `plan` · `help` | How to begin |
 
-具体输入见工具 schema；低频操作见 [operations](skills/auto-dev/references/operations.md)。旧工具名、旧 operation 与历史记录继续可读。普通记录不等于确认。真实未决问题、人工验收、权限或暂停才要求等待。
+All are `/dsh-auto-dev <command>`; plain text after `/dsh-auto-dev` means `start`.
 
-## 能力与验证入口
+## Project knowledge base
 
-| 能力 | 实际入口与输出 | 产物场景 |
-| --- | --- | --- |
-| 可选计划与模式兼容 | `work_start` → 原始/有效模式、任务；有计划时仍按全部叶子收尾 | S34、S40、S41 |
-| 依赖与分组 | `work_plan` → DAG、叶子进度、主题；容器不作工作单元 | S18–S21、S34 |
-| 成功证据 | `work_submit` → ledger、检查与 UI 档位；拒绝失败、过期或冒用执行 | S33、S36、S40 |
-| 人工决定 | `work_extend` / accept / rework → 有来源的授权或新证据窗口 | S35、S36 |
-| 普通记录 | `work_control record` → 目标、回执、问答、方案、经验；旧入口共用 owner | S37、S42 |
-| 环境 | `work_env` → runtime.json；观测不能解除受保护规则 | S35、S38 |
-| 方法提示 | hook → 当前事件的方法与文档；不要求登记阅读 | S13、S39 |
-| 知识复用 | learning / remember → memory.json 或 project-domain.md；后续开工按请求取相关摘要 | S08、S42 |
-| 状态与界面 | 共享状态 owner → 工具、命令、回执、dock、右栏 | S22、S31、S41 |
-| 交接与恢复 | adopt / export / import / checkpoints / rollback → 历史与快照 | S17、S26、S27、S29 |
+Kept in your project's `.auto-dev/` as plain files you can read and edit:
 
-工作计划校验唯一 ID、层级与依赖环。只有通过提交验证才能完成叶子。删除未完成叶子不能缩减范围；范围缩减使用有来源的 dropped 路径。UI 单元在提交时按声明的 `static` / `logic` / `browser` 校验，未声明时提示。
-
-检查点使用 `git stash create` 和 `refs/auto-dev-v3/`，不移动 HEAD 或暂存区。回滚覆盖已跟踪的工作区文件，必须有具体授权；不恢复未跟踪文件、数据库、服务或外部副作用。导出的执行记录只是历史，接手会话必须取得当前窗口的新证据。
-
-## 知识与方法
-
-| 存储 | 内容 |
+| File | What it holds |
 | --- | --- |
-| `.auto-dev/runtime.json` | 当前运行事实、来源、失效状态与规则 |
-| `.auto-dev/memory.json` | 可复用工程事实、观察、根因记录与修复经验 |
-| `.auto-dev/project-domain.md` | 业务术语、规则与决定 |
-| 任务已有字段 | 本次目标、问答、回执、方案与进展 |
-| `.auto-dev/postmortem.md` | 旧复盘只读兼容；新记录写 memory.json |
+| `memory.json` | Pitfalls: root causes and fixes |
+| `runtime.json` | Environment: observed facts, with source and expiry |
+| `project-domain.md` | Business rules: terms and decisions you made |
 
-未知根因保留为 observation / hypothesis。记录过机制不等于本次已验证。十篇工艺指南按任务选择深度，入口见 [工艺索引](skills/auto-dev/SKILL.md)。patterns 是查阅材料，不是自动学习系统。
+Commit them to share with your team, or add `.auto-dev/` to `.gitignore`. Task progress lives in DSH's own storage.
 
-## 开发检查
+## Checkpoints and rollback
 
-要求 Node.js ≥20。`npm run check` 执行单元测试和真实插件产物场景；`npm run build:client` 构建客户端；`npm run flow` 跑端到端流；`npm run hooks:install` 装 pre-commit 钩子（提交前自动跑检查）。产物场景使用真实插件、工具和状态机，KV 为内存实现；它不能代替隔离宿主及浏览器验收。
+- Checkpoints are Git-based (under `refs/dsh-auto-dev/`) and never move your HEAD, branch or index. Background checkpoints keep the latest 5; the ones around milestones are kept.
+- Rollback restores Git-tracked files only, and every rollback needs your explicit OK. Untracked files, databases and running services are not covered.
+- Recursive deletes, history rewrites, deploys and destructive SQL run only with your OK for that task and that action.
 
-本文不宣称已测得 token、效率或自修复收益。
+## For developers
+
+In chats that opted in, the model gets seven tools:
+
+| Tool | Purpose |
+| --- | --- |
+| `work_start` | Register your request verbatim, with scope and acceptance criteria |
+| `work_plan` | Optional units, dependencies and grouping |
+| `work_submit` | Hand in a result tied to real executions from this session |
+| `work_status` | Read the task, its executions and the board |
+| `work_control` | Pause, accept, rework, hand off, checkpoints, notes |
+| `work_extend` | Record a decision you made, bound to one task and one action |
+| `work_env` | Facts about the environment, with their source |
+
+The engineering playbook lives in [skills/auto-dev](skills/auto-dev/SKILL.md).
+
+Local development needs Node.js ≥ 20:
+
+```sh
+npm install
+npm run check          # unit tests + end-to-end scenarios against the real plugin
+npm run build:client   # rebuild lib/client.js after editing src/client.js
+npm run hooks:install  # run the check before every commit
+```
+
+Host-side changes need a DSH restart; client changes need a page refresh.
+
+## License
+
+[MIT](LICENSE)

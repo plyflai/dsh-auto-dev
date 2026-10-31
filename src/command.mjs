@@ -5,6 +5,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import { newestFirst } from './lookup.mjs'
+import { handoffCard } from './craft.mjs'
 
 // Verbs a person types after the command name. Anything else is a request:
 // `/dsh-auto-dev 给 slug 加 trim` is how someone actually asks for work, and
@@ -82,15 +83,12 @@ export function registerCommand(ctx, {
             const waiting = unfinishedElsewhere(agent)
             if (waiting.length > 0) {
               const adopted = await adoptTask({ taskId: waiting[0].id }, agent)
-              const resume = `继续 ${adopted.taskId}（${brief(adopted.request ?? '', 80)}）。用户这次说：「${rest}」。先看一眼它的计划与进度（work_status；只暴露 run_code 的会话里走 run_code：await tools.work_status(...)），然后接着做没做完的那个单元——不要重新登记一个任务。`
+              const resume = `继续 ${adopted.taskId}（${brief(adopted.request ?? '', 80)}）。用户这次说：「${rest}」。接手卡上是这个任务留下的事实；不要重新登记一个任务。`
               const opened = openTurn(invocation, resume, attachments)
               const where = adopted.from === sessionId(agent) ? '本会话' : '别的会话'
               // 人刚点了一下，得先有一行东西证明"交接发生了"，否则要等模型
               // 调完第一个工具才看得见。这行随下一次 pre-step 一起到。
-              queueReceipt(agent, notice(
-                `**接手 · ${adopted.taskId}** — 从${where}接手，接着做没做完的单元（${brief(adopted.request ?? '', 40) || '原任务'}）`,
-                `dsh-auto-dev handoff ${adopted.taskId}`,
-                { form: 'handoff', data: { unit: adopted.taskId, title: `接手 · ${adopted.taskId}`, line: `从${where}接过来，接着做没做完的单元`, tag: adopted.before?.ref ? `已存档 #${adopted.before.seq}` : '已存档', tone: 'neutral' } }))
+              queueReceipt(agent, notice(...await handoffCard(records.get('tasks', adopted.taskId), { from: where })))
               if (opened.ok) return { kind: 'success', text: `这个项目有没做完的 ${adopted.taskId}（在${where}），已接管并交给模型继续：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}。要另开新任务用 /dsh-auto-dev new。` }
               intake.set(sessionId(agent), { kind: 'adopt', taskId: adopted.taskId, from: adopted.from, at: new Date().toISOString() })
               return { kind: 'success', text: `已接管 ${adopted.taskId}（在${where}），但没能直接开一轮（${opened.reason}）。发下一条消息，模型会先读进度再继续。` }
@@ -103,9 +101,9 @@ export function registerCommand(ctx, {
           // a host that refuses to open a turn still delivers the request on the
           // person's next message instead of losing it.
           const opened = openTurn(invocation, rest, attachments)
-          if (opened.ok) return { kind: 'success', text: `已交给模型：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}\n它会先 work_start 登记任务（车道、范围、验收由它定），进度看 /dsh-auto-dev status。` }
+          if (opened.ok) return { kind: 'success', text: `已交给模型：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}\n任务已登记，进度看 /dsh-auto-dev status。` }
           intake.set(sessionId(agent), { kind: 'start', text: rest, at: new Date().toISOString() })
-          return { kind: 'success', text: `记下了，但没能直接开一轮（${opened.reason}）。发下一条消息（哪怕只说「开始」），模型就会按这段话调用 work_start。附件这次没能带过去，请在下一轮重新贴。` }
+          return { kind: 'success', text: `记下了，但没能直接开一轮（${opened.reason}）。发下一条消息（哪怕只说「开始」），模型就会按这段话开工。附件这次没能带过去，请在下一轮重新贴。` }
         }
         if (operation === 'tasks') {
           const project = projectOf(agent, ['.'])
@@ -125,11 +123,12 @@ export function registerCommand(ctx, {
           if (!task) return { kind: 'error', text: '这个会话还没有任务：先用 /dsh-auto-dev start <需求> 开一个。' }
           await optIn(agent)
           const proposal = await proposeOrganize(task, agent)
+          if (!proposal) return { kind: 'error', text: '这个任务还没有计划，没东西可整理。' }
           const lines = [
             `日需 ${proposal.daily.length} 件${proposal.daily.length ? `：${proposal.daily.slice(0, 8).join(', ')}` : ''}`,
             `战役主题 ${proposal.themes.length} 个${proposal.themes.length ? `：${proposal.themes.map(theme => `${theme.label}(${theme.units.length})`).join('、')}` : ''}`,
           ]
-          const opened = openTurn(invocation, `用户刚跑了 /dsh-auto-dev organize 体检。\n记录里现在是：${lines.join('；')}。\n请用 ask_user_question 问他：这份整理提案是否满意；不满意的话问他希望怎么整理（归组到哪个主题、哪些该拆开、哪个该改名）。他只说了「整理一下」不算同意。\n他点头后你再用 work_plan operation:"organize" action:"apply"，带上 proposalId ${proposal.id}、他的原话和具体 steps——只做他同意的那几步。`, attachments)
+          const opened = openTurn(invocation, `用户刚跑了 /dsh-auto-dev organize 体检。\n记录里现在是：${lines.join('；')}。\n请用 ask_user_question 问他：这份整理提案是否满意；不满意的话问他希望怎么整理（归组到哪个主题、哪些该拆开、哪个该改名）。他只说了「整理一下」不算同意。\n他点头后再按提案 ${proposal.id} 整理计划，只做他同意的那几步。`, attachments)
           const notice = `已生成整理提案 ${proposal.id}（只写记录，计划没动）。\n${lines.join('\n')}`
           if (opened.ok) return { kind: 'success', text: `${notice}\n已经交给模型：它会用提问卡问你满不满意，你点头后才会改。` }
           return { kind: 'success', text: `${notice}\n没能直接开一轮（${opened.reason}）；发下一条消息，模型会先看到这份提案。` }
@@ -141,18 +140,15 @@ export function registerCommand(ctx, {
           // Adopting is starting work here, so it is also the opt-in.
           await optIn(agent)
           const adopted = await adoptTask({ taskId: target }, agent)
+          if (!adopted.taskId) return { kind: 'error', text: adopted.tellUser }
           // Continuing is the whole point of adopting, so the turn starts here
           // instead of waiting for the person to say "go" a second time.
-          const opened = openTurn(invocation, `继续 ${adopted.taskId}：「${brief(adopted.request ?? '', 80)}」。先看进度（work_status；只暴露 run_code 的会话里走 run_code：await tools.work_status(...)），然后接着做没做完的那个单元。`, attachments)
+          const opened = openTurn(invocation, `继续 ${adopted.taskId}：「${brief(adopted.request ?? '', 80)}」。接手卡上是这个任务留下的事实。`, attachments)
           if (opened.ok) {
             // The person watched a task move between windows; that is a fact about
             // their work, not about the model's next tool call.
             if (adopted.adopted) {
-              queueReceipt(agent, notice(
-                `**接手 · ${adopted.taskId}** — 从会话 ${adopted.from ?? '另一处'} 接过来，接着做没做完的单元`,
-                `dsh-auto-dev handoff ${adopted.taskId}`,
-                { form: 'handoff', data: { unit: adopted.taskId, title: `接手 · ${adopted.taskId}`, line: `从会话 ${adopted.from ?? '另一处'} 接过来，接着做没做完的单元`, tag: '已存档', tone: 'neutral' } },
-              ))
+              queueReceipt(agent, notice(...await handoffCard(records.get('tasks', adopted.taskId), { from: `会话 ${adopted.from ?? '另一处'}` })))
             }
             return { kind: 'success', text: adopted.adopted
               ? `已接管 ${adopted.taskId}（原来在 ${adopted.from}），模型会先读进度再继续。`

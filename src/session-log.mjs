@@ -68,7 +68,7 @@ function errorText(content = []) {
  * really ran and failed: the first changed nothing, the second may have.
  */
 export function wasRefused(row) {
-  return !!row?.isError && typeof row?.errorText === 'string' && /^(?:Error: )?auto-dev-v3: /.test(row.errorText)
+  return !!row?.isError && typeof row?.errorText === 'string' && /^(?:Error: )?dsh-auto-dev[: ]/.test(row.errorText)
 }
 
 /** DSH shell renderers report process failure in a terminal status suffix, not isError. */
@@ -205,29 +205,6 @@ function deepFreeze(value) {
   return value
 }
 
-/** `"call-7"` or `{ callId }` or `{ sessionId, seq, callId }`. */
-export function referenceKey(reference) {
-  if (typeof reference === 'string') return { callId: reference }
-  if (!reference || typeof reference !== 'object') return undefined
-  const callId = reference.callId
-  if (typeof callId !== 'string' || callId === '') return undefined
-  return { callId, ...(typeof reference.seq === 'number' ? { seq: reference.seq } : {}),
-    ...(typeof reference.sessionId === 'string' ? { sessionId: reference.sessionId } : {}) }
-}
-
-/** Resolve one claim's reference against the collected observations. */
-export function findExecution(observations, reference) {
-  const key = referenceKey(reference)
-  if (!key) return { ok: false, reason: 'a claim needs an execution reference: { callId } from work_status(view="executions")' }
-  const rows = observations.results.filter(row => row.callId === key.callId)
-  if (!rows.length) {
-    return { ok: false, reason: `execution ${key.callId} is not an observed result in this task — evidence comes from a tool call, not from prose` }
-  }
-  const row = key.seq === undefined ? rows[rows.length - 1] : rows.find(entry => entry.seq === key.seq) ?? rows[rows.length - 1]
-  return { ok: true, row }
-}
-
-/** Count file-changing executions that ran after `seq`. */
 /**
  * A call that handed work to another agent.
  *
@@ -236,28 +213,7 @@ export function findExecution(observations, reference) {
  * to record that the task delegated and require the parent to check the result
  * itself — not to pretend the window saw everything.
  */
-export function isDelegation(row) {
-  return /^(subagent|spawn_agent|workflow)(?:_|$)/.test(row?.name ?? '')
-}
-
-export function writesAfter(observations, seq) {
-  // A refused write changed nothing: counting it as a change makes an honest
-  // check look stale for a reason the model cannot see.
-  return observations.results.filter(row => row.seq > seq && isWriteExecution(row) && !wasRefused(row))
-}
-
-/**
- * Drop quoted spans so a string that merely *describes* a shell action is not
- * mistaken for one. `node -e "… => …"` was read as a redirection because the
- * arrow ends in `>`, which made an honest read-only check invalidate an earlier
- * passing test run (observed in journey E, third pass).
- */
-const unquoted = command => String(command)
-  .replace(/"(?:[^"\\]|\\.)*"/g, ' ')
-  .replace(/'(?:[^'\\]|\\.)*'/g, ' ')
-
-/** A successful tool call can still contain a failed or interrupted process. */
-/** Whether a tool result reports a failed run, read the same way the evidence gate reads it. */
+/** Whether a tool result reports a failed run: the exit code the host printed, a signal, a timeout. */
 export function resultFailed(content, name, isError) {
   return executionFailed({ isError, ...resultDetails(Array.isArray(content) ? content : [], name) })
 }
@@ -267,50 +223,10 @@ export function executionFailed(row) {
     || row?.signal || row?.aborted || row?.timedOut)
 }
 
-/**
- * Only a direct command or an && chain carries every check's failure to the host.
- * `npm test; echo $?` actually hid a failed check behind a successful tool result.
- * Complex shell programs can run, but need a separate direct check as evidence.
- * Quoted program text is not a command name (e.g. echo "npm test").
- */
-export function evidenceCommand(command) {
-  if (typeof command !== 'string' || !command.trim()) return undefined
-  const visible = unquoted(command).trim()
-  const controls = visible.replace(/&&|\d?>&\d/g, ' ')
-  if (/[;|&!\n\r`()]/.test(controls) || /\$\(/.test(command)) return undefined
-  const runs = visible.split('&&').map(part => part.trim().replace(/^(?:[A-Za-z_]\w*=\S*\s+)*/, ''))
-  if (runs.some(run => !run || /(?:^|\s)(?:(?:\S+\/)?(?:ba|da|a|z|k)?sh\b|eval\b|(?:pwsh|powershell)\b)/i.test(run)
-    || /^(?:env|command|xargs)\b/i.test(run))) return undefined
-  return runs.join(' && ')
+export function isDelegation(row) {
+  return /^(subagent|spawn_agent|workflow)(?:_|$)/.test(row?.name ?? '')
 }
 
-/** A redirection that writes a file, as opposed to `=>`, `2>`, `>&1` or `>=`. */
-const REDIRECT = /(^|[\s;&|(])>{1,2}(?!>|=)\s*([^\s&|;>]+)/
-
-/**
- * Remember a pure per-row answer. Observation rows are frozen, so what a row says
- * can never change under the memo; a row a caller built by hand is recomputed.
- */
-export function perRow(fn) {
-  const memo = new WeakMap()
-  return row => {
-    if (!row || typeof row !== 'object' || !Object.isFrozen(row)) return fn(row)
-    if (!memo.has(row)) memo.set(row, fn(row))
-    return memo.get(row)
-  }
-}
-
-export const isWriteExecution = perRow(row => {
-  if (WRITE_TOOLS.has(row.name)) return true
-  if (row.name === 'bash' || row.name === 'pwsh' || row.name === 'shell') {
-    const command = unquoted(row.command ?? '')
-    return REDIRECT.test(command) || /(^|\s)(tee|sed\s+-i|perl\s+-i|mv|cp|rm|mkdir|touch|truncate|patch|git\s+(add|commit|apply|rebase|merge|checkout|restore))\b/.test(command)
-  }
-  return false
-})
-
-export const isReadOnlyTool = name => ['read', 'glob', 'grep', 'codegraph', 'work_status', 'work_plan'].includes(name)
-  || name === 'compress' || name === 'ask_user_question'
 
 /** Compact, replayable reference — enough context to pick the right claim. */
 export function executionSummary(row) {

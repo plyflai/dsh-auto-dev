@@ -1,8 +1,8 @@
 /**
- * dsh-auto-dev-v3 — client half.
+ * dsh-auto-dev — client half.
  *
  * One bar above the composer and one sidebar tab, both drawn from the
- * `autoDevV3` session projection.
+ * `dshAutoDev` session projection.
  *
  * Visual language: Swiss restraint on the host's own tokens. Hairline rules
  * instead of boxes, one accent (the host's business blue) used for progress,
@@ -53,7 +53,11 @@ const live = state => ['active', 'paused'].includes(settledState(state))
 const clamp = (value, max) => (value.length > max ? `${value.slice(0, max - 1)}…` : value)
 const headline = state => settledState(state) === 'closed' && state.last
   ? `上一次交付：${outcomeWord(state.last.outcome)}${state.last.summary ? ` · ${clamp(state.last.summary, 52)}` : ''}`
-  : clamp(cleanNext(state.next) || state.goal || state.request || '', 72)
+  // Waiting on the person, the model's own "next" is moot ("无；三项单元全部完成"):
+  // the line names what was delivered.
+  : settledState(state) === 'review_ready'
+    ? clamp(state.goal || state.request || cleanNext(state.next) || '', 72)
+    : clamp(cleanNext(state.next) || state.goal || state.request || '', 72)
 
 // Every glyph here has to be text-presentation: U+25B6 (▶) is emoji-capable, and
 // browsers hand it to the emoji font, which ignores `color` — the row's mark came
@@ -310,14 +314,18 @@ body[data-ds-dark-theme] .ad3{--ad3-bg:var(--dsw-alias-bg-base,#17191c);--ad3-su
 .ad3-seal{opacity:.4}
 .ad3-seal[data-on=true]{opacity:1;color:var(--ad3-accent)}
 .ad3-ask{font-size:10px;padding:0 5px;border-radius:4px;color:#9a7420;border:1px solid #9a742055}
-/* Receipts. A state change is a card on the page's own surface: hairline edge,
-   one tone dot, no tinted slab. Procedure is a bare line under the work — only
-   its glyph carries a tone, so ten method hints never outweigh one delivery. */
-.ad3-ev{--ad3-tone:var(--ad3-accent);margin:8px 0;padding:10px 14px 10px 12px;border-radius:12px;background:var(--ad3-surface);box-shadow:0 0 0 .5px var(--ad3-border-strong),0 1px 2px rgba(15,20,25,.04)}
+/* Receipts. Everything dsh-auto-dev puts into the conversation is a translucent
+   capsule in its tone, so a person tells the plugin's word from the model's at a
+   glance: a state change is a card, procedure a one-line pill. The tint stays
+   light (7–8%) so ten method hints still never outweigh one delivery. */
+.ad3{--ad3-tip:#3f74c9}
+@media(prefers-color-scheme:dark){.ad3{--ad3-tip:#7ea6e8}}
+body[data-ds-dark-theme] .ad3{--ad3-tip:#7ea6e8}
+.ad3-ev{--ad3-tone:var(--ad3-accent);margin:8px 0;padding:10px 14px 10px 12px;border-radius:14px;background:color-mix(in srgb,var(--ad3-tone) 7%,transparent);box-shadow:inset 0 0 0 .5px color-mix(in srgb,var(--ad3-tone) 30%,transparent)}
 .ad3-ev[data-tone=ask]{--ad3-tone:var(--ad3-warning)}
 .ad3-ev[data-tone=blocked]{--ad3-tone:var(--ad3-danger)}
 .ad3-ev[data-tone=guard]{--ad3-tone:var(--ad3-warning)}
-.ad3-ev[data-tone=info],.ad3-ev[data-tone=neutral]{--ad3-tone:var(--ad3-caption)}
+.ad3-ev[data-tone=info],.ad3-ev[data-tone=neutral]{--ad3-tone:var(--ad3-tip)}
 .ad3-ev-head{display:flex;align-items:center;gap:8px;min-width:0;font-size:13px;line-height:20px;font-weight:600;color:var(--ad3-text)}
 .ad3-ev-dot{flex:none;width:7px;height:7px;margin:0 2px 0 1px;border-radius:50%;background:var(--ad3-tone);box-shadow:0 0 0 3px color-mix(in srgb,var(--ad3-tone) 16%,transparent)}
 .ad3-ev-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -329,7 +337,7 @@ body[data-ds-dark-theme] .ad3{--ad3-bg:var(--dsw-alias-bg-base,#17191c);--ad3-su
 .ad3-ev-warn>b{flex:none;font-weight:700;color:var(--ad3-warning)}
 .ad3-ev-warn>span:first-of-type{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ad3-ev-more{flex:none;font-size:11px;color:var(--ad3-caption);font-variant-numeric:tabular-nums}
-.ad3-ev-row{--ad3-tone:var(--ad3-caption);display:flex;align-items:center;gap:8px;min-width:0;margin:2px 0;padding:3px 2px 3px 14px;font-size:12px;line-height:18px;color:var(--ad3-caption)}
+.ad3-ev-row{--ad3-tone:var(--ad3-tip);display:flex;align-items:center;gap:8px;min-width:0;margin:4px 0;padding:4px 12px;border-radius:999px;font-size:12px;line-height:18px;color:var(--ad3-caption);background:color-mix(in srgb,var(--ad3-tone) 8%,transparent);box-shadow:inset 0 0 0 .5px color-mix(in srgb,var(--ad3-tone) 26%,transparent)}
 .ad3-ev-row .ad3-ev-glyph{flex:none;width:12px;text-align:center;font-size:10.5px;color:var(--ad3-tone)}
 .ad3-ev-row .ad3-ev-title{flex:none;color:var(--ad3-muted);font-weight:500}
 .ad3-ev-row .ad3-ev-line{color:var(--ad3-caption);font-size:12px;line-height:18px}
@@ -338,7 +346,7 @@ body[data-ds-dark-theme] .ad3{--ad3-bg:var(--dsw-alias-bg-base,#17191c);--ad3-su
 .ad3-ev-row[data-tone=done],.ad3-ev-row[data-tone=open]{--ad3-tone:var(--ad3-accent)}
 /* The plugin said no to a call. It is the one row that speaks up: a person who
    only sees the failed tool call above it would read it as the agent stuck. */
-.ad3-ev-row[data-tone=guard]{--ad3-tone:var(--ad3-warning);margin:6px 0;padding:6px 12px;border-radius:9px;background:color-mix(in srgb,var(--ad3-warning) 8%,transparent);box-shadow:inset 0 0 0 .5px color-mix(in srgb,var(--ad3-warning) 30%,transparent)}
+.ad3-ev-row[data-tone=guard]{--ad3-tone:var(--ad3-warning);margin:6px 0;padding:6px 12px;border-radius:999px;background:color-mix(in srgb,var(--ad3-warning) 8%,transparent);box-shadow:inset 0 0 0 .5px color-mix(in srgb,var(--ad3-warning) 30%,transparent)}
 .ad3-ev-row[data-tone=guard] .ad3-ev-title{color:var(--ad3-warning);font-weight:600}
 .ad3-ev-row[data-tone=guard] .ad3-ev-line{color:var(--ad3-text)}
 /* Dock pulse: the unit in flight, how long it has run, and the last check. */
@@ -448,7 +456,7 @@ function State({ state }) {
 }
 
 function Bar({ useProjection, openBoard }) {
-  const state = useProjection('autoDevV3')
+  const state = useProjection('dshAutoDev')
   if (!state) return null
   const where = headline(state)
   const counting = state.counting ?? {}
@@ -590,7 +598,18 @@ const isPath = text => /\.(md|mjs|js|json)$/.test(text)
  * work. The words are the fixed eight; the second line is always the task's own
  * record, never a metaphor of ours.
  */
+// Cards in the conversation can mount with no dock or board on screen (a finished
+// session opened again, v35): they carry the stylesheet themselves, once per page.
+function ensureCss() {
+  if (typeof document === 'undefined' || document.getElementById('ad3-css')) return
+  const style = document.createElement('style')
+  style.id = 'ad3-css'
+  style.textContent = css
+  document.head.appendChild(style)
+}
+
 function StreamCard({ node }) {
+  ensureCss()
   const data = node?.data ?? {}
   const form = data.form
   const box = data.data ?? {}
@@ -634,7 +653,7 @@ function Seals({ pair }) {
   const after = pair?.after
   return h('span', {
     className: 'ad3-seals',
-    title: `开始前 ${before ? `已存 #${before.seq}` : '未存'} · 完成后 ${after ? `已存 #${after.seq}` : '未存'}`,
+    title: `${before?.label ?? '开始前'} ${before ? `已存 #${before.seq}` : '未存'} · ${after?.label ?? '完成后'} ${after ? `已存 #${after.seq}` : '未存'}`,
   },
   h('span', { className: 'ad3-seal', 'data-on': before ? 'true' : 'false' }, '前'),
   h('span', { className: 'ad3-seal', 'data-on': after ? 'true' : 'false' }, '后'))
@@ -936,7 +955,7 @@ function Timeline({ rows, openOf, onOpen }) {
 }
 
 function Board({ useProjection }) {
-  const state = useProjection('autoDevV3')
+  const state = useProjection('dshAutoDev')
   // Collapsing is a property of the reader, not of the task: a finished milestone is
   // collapsed the first time it is seen, and whatever the reader opens stays open
   // while the fold keeps producing new state objects.
@@ -1055,27 +1074,27 @@ export { Board, StreamCard, css }
 export const inject = ['slots', 'sidebarRight', 'sidebarRightTabs', 'uiConversation']
 
 export function apply(ctx) {
-  const tabId = 'dsh-auto-dev-v3/board'
-  const kind = 'auto-dev-v3-board'
+  const tabId = 'dsh-auto-dev/board'
+  const kind = 'dsh-auto-dev-board'
 
   ctx.effect(() => ctx.sidebarRightTabs.register({
     id: tabId,
     kind,
     title: () => 'Auto Dev',
     guide: [{ id: 'board', order: 20, title: () => 'Auto Dev', description: () => '任务、分步与最近一次交付' }],
-  }), 'auto-dev-v3 board tab')
+  }), 'dsh-auto-dev board tab')
 
   ctx.effect(() => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register({
     name: 'conversation.input.dock',
-    id: 'auto-dev-v3-dock',
+    id: 'dsh-auto-dev-dock',
     order: -18,
     inject: () => ({ openBoard: () => ctx.sidebarRight.openTab(kind) }),
-  }, Bar)), 'auto-dev-v3 dock bar')
+  }, Bar)), 'dsh-auto-dev dock bar')
 
   ctx.effect(() => ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
     name: 'sidebar.right.pane.tab',
     key: tabId,
-  }, Board)), 'auto-dev-v3 board body')
+  }, Board)), 'dsh-auto-dev board body')
 
   // The conversation's own node type. Two halves that must arrive together: the
   // claim (`exclusive` hides the generic context row) and the view that draws it.
@@ -1096,7 +1115,7 @@ export function apply(ctx) {
         const source = event.data?.source
         // Must equal the `source.kind` the host half writes in notice(): a mismatch
       // here silently un-claims every card and the rows fall back into the process fold.
-      if (!source || source.kind !== 'auto-dev-v3') return null
+      if (!source || source.kind !== 'dsh-auto-dev') return null
         // Plain progress notices keep the compact row they already had; only the
         // events that carry a form earn a card.
         if (!source.form || source.form === 'notice') return null
@@ -1144,12 +1163,12 @@ export function apply(ctx) {
       if (typeof unclaim === 'function') unclaim()
       if (typeof unview === 'function') unview()
     }
-    ctx.effect(() => releaseCards, 'auto-dev-v3 stream cards')
+    ctx.effect(() => releaseCards, 'dsh-auto-dev stream cards')
   } catch (error) {
     // Neither half stays: the plain context row is the floor, and it must not be
     // traded for a card that cannot draw.
     if (typeof releaseCards === 'function') releaseCards()
     releaseCards = null
-    console.warn('auto-dev-v3: stream cards unavailable on this build; status events stay as plain rows', error)
+    console.warn('dsh-auto-dev: stream cards unavailable on this build; status events stay as plain rows', error)
   }
 }

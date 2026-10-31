@@ -10,16 +10,20 @@
  * is reported as `forms` (in order) plus the final board. A scenario declares the
  * forms it must produce; the runner compares and exits non-zero on a miss.
  */
+import { boardOf, foldBoard, syncState } from '../src/projection.mjs'
 import { execFileSync } from 'node:child_process'
+import '../tests/env.mjs'
 import assert from 'node:assert/strict'
 import { inventory, PANEL_KEYS } from './inventory.mjs'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { stubHost } from './flow.mjs'
 import { readEnv } from '../src/env.mjs'
-import { readMemory } from '../src/memory.mjs'
+import { rememberDomain } from '../src/domain.mjs'
+import { readMemory, remember as rememberIncident } from '../src/memory.mjs'
+import { fillsIn } from './fills.mjs'
 
 const formsOf = message => message?.source?.form
 
@@ -31,16 +35,25 @@ function agentFor(state) {
       header: { id: state.sessionId },
       get seq() { return state.log.length },
       eventAt: index => state.log[index],
-      append: async event => { state.log.push(event); return event },
+      // The host's shape: append(type, data, intent). A dsh-auto-dev card written
+      // straight into the log is drawn like any other.
+      append: async (type, data) => {
+        const event = typeof type === 'string' ? { type, data } : type
+        state.log.push(event)
+        if (event.type === 'user/message' && event.data?.source?.kind === 'dsh-auto-dev') state.appended?.(event.data)
+        return event
+      },
     },
     followup: async message => { state.log.push({ type: 'user/message', data: { message } }); return {} },
   }
 }
 
+// Call ids unique across the whole bench: the plugin keeps per-call facts (src/disk.mjs) by id.
+let opened = 0
 async function open({ project, sessionId, checkpoints = false, tables }) {
   const host = stubHost({ cwd: project, ...(tables ? { tables } : {}) })
   await apply(host.ctx, { checkpoints })
-  const state = { project, sessionId, log: [], tables: host.tables, grants: [], commands: [] }
+  const state = { project, sessionId, log: [], tables: host.tables, grants: [], commands: [], run: ++opened }
   return { host, state }
 }
 
@@ -52,7 +65,7 @@ function helpers(host, state) {
   const collect = message => {
     trace.push({ message })
     const form = formsOf(message)
-    if (message.source?.summary?.startsWith('auto-dev-v3')) hints.push({
+    if (message.source?.summary?.startsWith('dsh-auto-dev')) hints.push({
       summary: message.source.summary,
       text: (message.content ?? []).map(part => part.text ?? '').join(''),
     })
@@ -60,6 +73,7 @@ function helpers(host, state) {
     receipts.push({ form, title: message.source.data?.title ?? '', line: message.source.data?.line ?? '', tag: message.source.data?.tag ?? '', ...(message.source.data?.warnings ? { warnings: message.source.data.warnings } : {}), text: Array.isArray(message.content) ? message.content.map(p => p.text ?? '').join('') : String(message.content ?? '') })
   }
   const agent = () => agentFor(state)
+  state.appended = message => collect(message)
   return {
     trace,
     receipts,
@@ -89,14 +103,27 @@ function helpers(host, state) {
       } : { ...agent(), followup: async () => ({}) }
       const result = await command.handler({ agent: commandAgent, rawInput })
       await Promise.all(followups)
+      // The real host splices the request in as the person's message (v31 #10); it is not a reply.
+      const request = String(rawInput).trim().replace(/^(start|new)\s+/, '')
+      if (/^(start|new)\s+\S/.test(String(rawInput).trim())) {
+        state.log.push({ type: 'user/message', data: { message: { id: `m-${state.log.length}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: request }] } } })
+      }
       if (/^(start|new)\b/.test(String(rawInput).trim())) state.grants.push(rawInput)
       return result
+    },
+    // The model ends its turn on `text`: the host's turn-stopping, with what the plugin steers back.
+    async stop(text) {
+      state.log.push({ type: 'assistant/message', data: { turn: 1, step: state.log.length, message: { role: 'assistant', content: [{ type: 'text', text }] } } })
+      const steered = []
+      await host.handlers.get('agent/turn-stopping')({ agent: { ...agent(), steer: message => { steered.push(message); collect(message) } },
+        turn: 1, signal: new AbortController().signal })
+      return steered
     },
     async tool(name, args = {}) {
       const definition = host.tools.get(name)
       if (!definition) throw new Error(`tool ${name} is not offered (not opted in?)`)
       calls.push({ name, args })
-      const callId = `call-${name}-${state.log.length}`
+      const callId = `call-${state.run}-${name}-${state.log.length}`
       state.log.push({ type: 'tool/call', data: { callId, name, arguments: args } })
       let value
       let failure
@@ -133,7 +160,7 @@ function helpers(host, state) {
       }
     },
     async exec(command) {
-      const callId = `call-bash-${state.log.length}`
+      const callId = `call-${state.run}-bash-${state.log.length}`
       state.log.push({ type: 'tool/call', data: { callId, name: 'bash', arguments: { command } } })
       const { NODE_TEST_CONTEXT: _workerContext, ...commandEnv } = process.env
       let output, failure
@@ -152,8 +179,21 @@ function helpers(host, state) {
       }
       return callId
     },
-    async pre(command) {
-      return host.handlers.get('tools/pre-execute')({ agent: agent(), callId: `pre-${state.log.length}`, name: 'bash', arguments: { command } }, async () => ({ kind: 'continue' }))
+    /** A file tool write (structured path), as the host reports it after it ran. */
+    async write(path, content) {
+      const callId = `call-${state.run}-write-${state.log.length}`
+      const args = { path: join(state.project, path), content }
+      state.log.push({ type: 'tool/call', data: { callId, name: 'write', arguments: args } })
+      writeFileSync(args.path, content)
+      state.log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: 'ok' }] } } })
+      const downstream = { additionalContexts: [] }
+      const out = await host.handlers.get('tools/post-execute')({ agent: agent(), name: 'write', arguments: args, callId }, downstream, async () => downstream)
+      for (const message of out?.additionalContexts ?? []) collect(message)
+      return callId
+    },
+    async pre(command, name = 'bash') {
+      const args = typeof command === 'string' ? { command } : command
+      return host.handlers.get('tools/pre-execute')({ agent: agent(), callId: `pre-${state.log.length}`, name, arguments: args }, async () => ({ kind: 'continue' }))
     },
     async board() {
       const value = await host.tools.get('work_status').execute({ view: 'board' }, { agent: agent(), callId: `call-status-${state.log.length}`, turn: 1 })
@@ -192,7 +232,7 @@ add('S03', '单元开始（带交付物）', ['unit-start'], async h => {
   await h.tool('work_plan', { operation: 'set', units: plan().units })
   await h.tool('work_plan', { operation: 'activate', unit: 'b1' })
 })
-add('S04', '载入模式 + 进入测试（refactor/verification 单元）', ['read-doc', 'verify-start'], async h => {
+add('S04', '单元带 kind 只是标签：激活不出关键词卡（第三条路：语义归模型）', ['unit-open'], async h => {
   await h.cmd('start 重构导出并回归')
   await h.tool('work_start', { request: '重构导出并回归', mode: 'do', scope: ['.'], acceptance: ['旧行为不变'] })
   await h.tool('work_plan', { operation: 'set', units: [
@@ -201,6 +241,7 @@ add('S04', '载入模式 + 进入测试（refactor/verification 单元）', ['re
   ] })
   await h.tool('work_plan', { operation: 'activate', unit: 'b1' })
   await h.tool('work_plan', { operation: 'activate', unit: 'b2' })
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, 'kind 不触发方法卡')
 })
 add('S05', '完成 + 收案 + 看一眼', ['unit-done', 'review'], async h => {
   await h.cmd('start 做一个导出')
@@ -272,34 +313,6 @@ add('S12', '换个更省事的做法', ['alternative'], async h => {
   await h.tool('work_start', { request: '做一个导出', mode: 'do', scope: ['.'], acceptance: ['能导出'] })
   await h.tool('work_control', { operation: 'alternative', text: '先复用现有导出器，只补两种格式' })
 })
-add('S13', '真实失败给排查方法，分段进展不触发停工', ['read-doc'], async h => {
-  await h.cmd('start 做一个导出')
-  await h.tool('work_start', { request: '做一个导出', mode: 'do', scope: ['.'], acceptance: ['能导出'] })
-  for (let i = 0; i < 3; i += 1) {
-    const ran = await h.exec('node -e "console.log(1)"')
-    await h.tool('work_submit', { outcome: 'partial', summary: `发现 ${i + 1}`, next: '继续排查', claims: [{ statement: '实际探针完成', execution: { callId: ran } }] })
-  }
-  await h.step()
-  assert.equal(h.hints.some(row => /method debug/.test(row.summary)), false)
-  const fail = 'node -e "process.exit(1)"'
-  await h.exec(fail)
-  await h.exec(fail)
-  await h.step()
-  assert.match(h.hints.find(row => /method debug/.test(row.summary))?.text ?? '', /最小复现/)
-  assert.equal(h.receipts.some(row => row.form === 'halt'), false)
-  assert.equal((await h.board()).task.state, 'active')
-})
-add('S14', 'postmortem（带失败关掉）', ['postmortem'], async h => {
-  await h.cmd('start 做一个导出')
-  await h.tool('work_start', { request: '做一个导出', mode: 'do', scope: ['.'], acceptance: ['能导出'] })
-  await h.tool('work_plan', { operation: 'set', units: [{ id: 'b1', goal: '导出', scope: ['.'], acceptance: ['能导'] }] })
-  await h.tool('work_plan', { operation: 'activate', unit: 'b1' })
-  const ran = await h.exec('node -e "console.log(1)"')
-  await h.tool('work_submit', { unit: 'b1', outcome: 'blocked', summary: '跑了三次都空表', next: '再看', claims: [{ statement: '跑了一遍，空表', execution: { callId: ran } }] })
-  await h.tool('work_control', { operation: 'cancel', reason: '先放下' })
-  await h.step()
-})
-
 add('S15', '收案（人看了一眼说可以）', ['review-done'], async h => {
   await h.cmd('start 做一个导出')
   await h.tool('work_start', { request: '做一个导出', mode: 'do', scope: ['.'], acceptance: ['能导出'] })
@@ -495,21 +508,17 @@ add('S26', '任务生命周期：暂停/继续/目标/回执/澄清/假设/复�
   for (const receipt of other.receipts) h.receipts.push(receipt)
 })
 
-add('S27', '存档与回滚', [], async h => {
+add('S27', '存档与回滚：G2 先拦一次，用户回话后才回滚', [], async h => {
   await h.cmd('start 改一个文件')
   // 先把工作树弄脏：`git stash create` 只收已跟踪文件的改动，干净树什么都没有。
   writeFileSync(join(h.state.project, 'README.md'), '# first change\n')
   await h.tool('work_start', { request: '改一个文件', mode: 'do', scope: ['.'], acceptance: ['改完'] })
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'b1', goal: '改文件', scope: ['.'], acceptance: ['改完'] }] })
   writeFileSync(join(h.state.project, 'README.md'), '# changed\n')
-  const saved = await h.tool('work_control', { operation: 'checkpoints' })
-  // The grant needs the person's own words on file: they say it first, then the
-  // model asks for permission quoting them.
-  const action = `rollback ${saved.recorded.before.ref ?? saved.recorded.before.commit}`
-  await h.tool('work_extend', { kind: 'authorization', risk: 'rollback', action, reason: '要撤回到改动前' })
-  const authorization = `允许 ${action}`
-  await h.say(authorization)
-  await h.tool('work_extend', { kind: 'authorization', risk: 'rollback', action, reason: '要撤回到改动前', authorization })
+  await h.tool('work_control', { operation: 'checkpoints' })
+  // G2：第一次回滚被拦，说清过关办法；用户回了话，同一类操作放行。没有要模型抄的原话。
+  await assert.rejects(h.tool('work_control', { operation: 'rollback', target: 'before' }), /回滚会覆盖还没提交的改动.*\n过关：先问用户/s)
+  await h.say('回吧')
   await h.tool('work_control', { operation: 'rollback', target: 'before' })
 }, { checkpoints: true, git: true })
 
@@ -603,72 +612,68 @@ add('S31', '项目时间线：开新任务不盖掉旧任务，新的在上、�
   if (!Array.isArray(past.units) || past.units.length < 1) throw new Error('旧任务展开后没有单元')
 })
 
-add('S32', '命令已授权：提示登记任务，写文件不再要求重输命令，看板出现目标', [], async h => {
+add('S32', '命令即登记：用户原话直接成任务，模型什么都不用填，写文件不再提示开工，看板出现目标', [], async h => {
   const request = '把登录按钮改成进度条'
   await h.cmd(`start ${request}`, { deliverFollowup: true })
-  const granted = h.hints.find(hint => hint.summary === 'auto-dev-v3 start granted')
-  if (!granted?.text.includes('work_start 登记任务') || !granted.text.includes(request)) throw new Error('命令后的真实 pre-step 没有提示登记原始请求')
+  const granted = h.hints.find(hint => hint.summary === 'dsh-auto-dev start granted')
+  if (!granted?.text.includes('已经登记好') || !granted.text.includes(request)) throw new Error('命令后的真实 pre-step 没有按原话直接登记任务')
+  if (/work_start|scope|acceptance/.test(granted.text)) throw new Error('开工提示还在教模型调用登记、填参数')
   if (h.hints.some(hint => /standing hint|resume hint/.test(hint.summary))) throw new Error('有效授权被未开工或续接提示覆盖')
   await h.exec('printf draft > draft.txt')
-  const writeHint = h.hints.find(hint => hint.summary === 'auto-dev-v3 start hint')
-  if (writeHint?.text !== granted.text) throw new Error('登记前写文件仍要求用户重输命令')
-  if (Object.keys(h.host.tables.tasks).length !== 0) throw new Error('提示不应自动创建任务')
-  await h.tool('work_start', { request: '模型缩写', mode: 'do', scope: ['.'], acceptance: ['按钮显示进度'] })
+  if (h.hints.some(hint => hint.summary === 'dsh-auto-dev start hint')) throw new Error('已登记还在提示开工')
+  if (Object.keys(h.host.tables.tasks).length !== 1) throw new Error('一次 start 应恰好一条任务')
   const board = await h.board()
   if (board.task?.request !== request) throw new Error('看板缺少命令中的原始目标')
   if (board.timeline?.length !== 1 || !board.timeline[0].current) throw new Error('登记后看板仍为空')
 })
 
-add('S33', 'P0：界面检查拒绝不落账（只给人一行「拦下」），修复后只完成一次', ['unit-open', 'blocked-call', 'task-done'], async h => {
+add('S33', 'P0：G1 由插件交付时自己在项目里跑检查——红就退回不落账（只给人一行「拦下」），吞退出码的写法骗不过，修好后只完成一次', ['unit-open', 'blocked-call', 'task-done'], async h => {
   await h.cmd('start 实际运行界面逻辑检查')
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
   await h.tool('work_start', { request: '实际运行界面逻辑检查', mode: 'do', acceptanceMode: 'auto', scope: ['.'], acceptance: ['项目测试通过'] })
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'ui', goal: '验证界面逻辑', scope: ['.'], acceptance: ['检查通过'], ui: 'logic' }] })
   await h.tool('work_plan', { operation: 'activate', unit: 'ui' })
-  const proof = await h.exec('node -e "console.log(1)"')
-  const args = { unit: 'ui', outcome: 'complete', summary: '检查通过', next: '查看结果', claims: [{ statement: '检查通过', execution: { callId: proof } }] }
+  const G1 = /交付前插件在项目里跑了 `npm test`，没通过[\s\S]*过关：修好让它通过，再交/
+  const args = { unit: 'ui', outcome: 'complete', summary: '检查通过' }
+  const failed = await h.exec('npm test')
   const before = structuredClone(h.host.tables), count = h.receipts.length
-  await assert.rejects(h.tool('work_submit', args), /logic|界面|UI/)
+  // 插件自己跑的检查是红的：G1，模型引用什么都一样。
+  await assert.rejects(h.tool('work_submit', { ...args, claims: [{ statement: 'npm test 通过', execution: { callId: failed } }] }), G1)
   assert.deepEqual(h.host.tables, before)
   assert.equal(h.receipts.length, count + 1)
   assert.equal(h.receipts.at(-1).form, 'blocked-call')
   assert.match(h.receipts.at(-1).title, /拦下 · 交付退回/)
-  const failed = await h.exec('npm test')
-  await assert.rejects(h.tool('work_submit', { ...args, claims: [{ statement: 'npm test 通过', execution: { callId: failed } }] }), /failed/)
-  await assert.rejects(h.tool('work_submit', args), /logic|界面|UI/)
-  assert.deepEqual(h.host.tables, before)
-  const masked = await h.exec('npm test; echo "[exit code: $?]"')
-  await assert.rejects(h.tool('work_submit', { ...args, claims: [{ statement: 'npm test 通过', execution: { callId: masked } }] }), /mask a check.s failure/)
+  await assert.rejects(h.tool('work_submit', args), G1)
+  // 吞掉退出码的写法骗不过：插件跑的是自己那一次。
+  await h.exec('npm test; echo "[exit code: $?]"')
+  await assert.rejects(h.tool('work_submit', args), G1)
   assert.deepEqual(h.host.tables, before)
   assert.equal(h.receipts.length, count + 1, '同一单元反复退回只说一次')
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
-  const passed = await h.exec('npm test')
-  await h.tool('work_submit', { ...args, claims: [{ statement: '项目测试通过', execution: { callId: passed } }] })
+  await h.exec('npm test')
+  await h.tool('work_control', { operation: 'remember', payload: { kind: 'incident', symptom: '项目测试失败', ruledOut: ['不是界面档问题'] } })
+  await h.tool('work_submit', args)
   assert.equal(Object.values(h.host.tables.tasks)[0].ledger.length, 1)
   assert.equal(h.receipts.filter(row => row.form === 'task-done').length, 1)
 })
 
-add('S34', 'P0：全部计划入口拒绝伪完成，阻塞单元保持可见', ['unit-open', 'unit-done'], async h => {
+add('S34', 'P0：写成完成的单元一律回到待做（只有交付能完成），删掉没做完的单元会留下并告诉用户，阻塞单元保持可见', ['unit-open', 'unit-done'], async h => {
   await h.cmd('start 检查计划完成边界')
   const a = { id: 'a', goal: '先做检查', scope: ['.'], acceptance: ['检查通过'] }
-  await assert.rejects(h.tool('work_start', { request: '检查计划完成边界', mode: 'do', scope: ['.'], acceptance: ['全部完成'], plan: { units: [{ ...a, state: 'done' }] } }), /done|work_submit/)
-  await h.cmd('start 检查计划完成边界')
-  await h.tool('work_start', { request: '检查计划完成边界', mode: 'do', acceptanceMode: 'auto', scope: ['.'], acceptance: ['全部完成'] })
-  await assert.rejects(h.tool('work_plan', { operation: 'set', units: [{ ...a, state: 'done' }] }), /done|work_submit/)
-  await h.tool('work_plan', { operation: 'set', units: [a, { id: 'b', goal: '等待外部条件', state: 'blocked', scope: ['.'], acceptance: ['条件满足'] }] })
-  await assert.rejects(h.tool('work_plan', { operation: 'add', units: [{ ...a, id: 'c', state: 'done' }] }), /done|work_submit/)
-  await assert.rejects(h.tool('work_plan', { operation: 'state', unit: 'a', state: 'done' }), /work_submit/)
-  await h.tool('work_plan', { operation: 'state', unit: 'b', state: 'blocked' })
-  for (const state of ['pending', 'active', 'blocked', 'dropped']) {
-    await h.tool('work_plan', { operation: 'state', unit: 'b', state })
-    const before = structuredClone(h.host.tables), count = h.receipts.length
-    for (const units of [[a], [a, { id: 'b', goal: '不能隐藏原工作', units: [{ id: 'c', goal: '新子项', scope: ['.'], acceptance: [] }] }]]) {
-      await assert.rejects(h.tool('work_plan', { operation: 'set', units }), /cannot remove unfinished leaf b/)
-      assert.deepEqual(h.host.tables, before)
-      assert.equal(h.receipts.length, count)
-    }
-  }
+  await h.tool('work_start', { request: '检查计划完成边界', mode: 'do', acceptanceMode: 'auto', scope: ['.'], acceptance: ['全部完成'], plan: { units: [{ ...a, state: 'done' }] } })
+  const unitState = id => Object.values(h.host.tables.plans)[0].units.find(row => row.id === id)?.state
+  assert.equal(unitState('a'), 'pending')
+  assert.deepEqual((await h.tool('work_plan', { operation: 'set', units: [{ ...a, state: 'done' }, { id: 'b', goal: '等待外部条件', state: 'blocked', scope: ['.'], acceptance: ['条件满足'] }] })).reopened, ['a'])
+  assert.deepEqual((await h.tool('work_plan', { operation: 'add', units: [{ ...a, id: 'c', state: 'done' }] })).reopened, ['c'])
+  // 重写计划时拿掉没做完的 c：它留下、记为不做，并要模型跟用户说一声。
+  const shrunk = await h.tool('work_plan', { operation: 'set', units: [a, { id: 'b', goal: '等待外部条件', state: 'blocked', scope: ['.'], acceptance: ['条件满足'] }] })
+  assert.deepEqual(shrunk.dropped, ['c'])
+  assert.match(shrunk.tellUser, /为什么不做/)
+  assert.equal(unitState('c'), 'dropped')
+  // 写回来就回到待做。
+  await h.tool('work_plan', { operation: 'set', units: [a, { id: 'b', goal: '等待外部条件', state: 'blocked', scope: ['.'], acceptance: ['条件满足'] }, { id: 'c', goal: '最后检查', scope: ['.'], acceptance: ['检查通过'] }] })
+  assert.equal(unitState('c'), 'pending')
   await h.tool('work_plan', { operation: 'state', unit: 'b', state: 'blocked' })
   await h.tool('work_plan', { operation: 'activate', unit: 'a' })
   const proof = await h.exec('node -e "console.log(1)"')
@@ -693,7 +698,6 @@ add('S34', 'P0：全部计划入口拒绝伪完成，阻塞单元保持可见', 
   assert.equal(regrouped.startedSeq, evidenceWindow)
   assert.deepEqual(Object.values(h.host.tables.tasks)[0].ledger, ledger)
   assert.equal(completed(), completedCount)
-  await h.tool('work_plan', { operation: 'add', units: [{ id: 'c', goal: '最后检查', scope: ['.'], acceptance: ['检查通过'] }] })
   await h.say('同意取消 b，移出本次范围')
   await h.tool('work_plan', { operation: 'state', unit: 'b', state: 'dropped', approval: '同意取消 b，移出本次范围' })
   const retained = Object.values(h.host.tables.plans)[0].units
@@ -705,45 +709,38 @@ add('S34', 'P0：全部计划入口拒绝伪完成，阻塞单元保持可见', 
   assert.ok(settled.task.unverified.some(row => row.includes('b') && row.includes('未完成')))
 })
 
-add('S35', 'P0：环境禁令可按真实决定撤销，其他禁令保留', ['env'], async h => {
+add('S35', 'P0：环境禁令只凭用户回话确认与撤销（G3 先拦一次），其他禁令保留', ['env'], async h => {
   await h.cmd('start 检查环境禁令')
   await h.tool('work_start', { request: '检查环境禁令', mode: 'do', scope: ['.'], acceptance: ['禁令来源可查'] })
   for (const key of ['migrations', 'secrets']) {
     await h.tool('work_env', { operation: 'propose', kind: 'blocked', key, value: `不得修改 ${key}/` })
-    if (key === 'migrations') for (const note of ['migrations 禁令有问题', '之后再说 migrations']) {
-      const before = await readEnv(h.state.project)
-      await h.say(note)
-      const count = h.receipts.length
-      await assert.rejects(h.tool('work_env', { operation: 'confirm', key, note }), /explicitly confirm/)
-      assert.deepEqual(await readEnv(h.state.project), before)
-      assert.equal(h.receipts.length, count)
-    }
     if (key === 'migrations') {
       const before = await readEnv(h.state.project), count = h.receipts.length
-      h.state.log.push({ type: 'tool/call', data: { callId: 'env-defer', name: 'ask_user_question', arguments: {
-        questions: [{ question: '确认 migrations 禁令吗？', options: ['采用候选', '之后再说'] }] } } })
-      h.state.log.push({ type: 'tool/result', data: { message: { toolCallId: 'env-defer',
-        content: [{ type: 'text', text: JSON.stringify({ answers: [{ answer: '之后再说' }] }) }] } } })
-      await assert.rejects(h.tool('work_env', { operation: 'confirm', key, note: '之后再说' }), /explicitly confirm/)
+      assert.match((await h.tool('work_env', { operation: 'confirm', key })).tellUser, /问用户一句/)
+      await h.say('不要这条')
+      assert.match((await h.tool('work_env', { operation: 'confirm', key })).tellUser, /没确认/)
       assert.deepEqual(await readEnv(h.state.project), before)
-      assert.equal(h.receipts.length, count)
+      assert.equal(h.receipts.slice(count).some(row => row.form === 'env'), false)
     }
     await h.say(`确认 ${key} 禁令`)
-    await h.tool('work_env', { operation: 'confirm', key, note: `确认 ${key} 禁令` })
+    await h.tool('work_env', { operation: 'confirm', key })
   }
-  assert.equal((await h.pre('cat migrations/old.sql')).kind, 'deny')
+  // G3 看文件工具自己的路径参数；命令文本不猜。
+  assert.equal((await h.pre('cat migrations/old.sql')).kind, 'continue')
+  assert.equal((await h.pre({ path: 'migrations/old.sql', content: 'x' }, 'write')).kind, 'deny')
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则\n过关：先问用户/)
   await h.say('不要撤销 migrations 禁令')
-  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations', note: '不要撤销 migrations 禁令' }), /refuses/)
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /用户没同意解除/)
   await h.say('撤销 migrations 禁令')
-  await h.tool('work_env', { operation: 'forget', key: 'migrations', note: '撤销 migrations 禁令' })
+  await h.tool('work_env', { operation: 'forget', key: 'migrations' })
   const receipt = h.receipts.findLast(row => row.form === 'env-forget')
-  assert.match(receipt.line, /用户已撤销规则 migrations/)
+  assert.match(receipt.line, /migrations/)
   assert.doesNotMatch(JSON.stringify(receipt), /已删/)
   const env = await readEnv(h.state.project)
   assert.equal(env.blocked.find(row => row.key === 'migrations').status, 'stale')
   assert.equal(env.blocked.find(row => row.key === 'migrations').history.length, 1)
-  assert.equal((await h.pre('cat migrations/old.sql')).kind, 'continue')
-  assert.equal((await h.pre('cat secrets/token.txt')).kind, 'deny')
+  assert.equal((await h.pre({ path: 'migrations/old.sql', content: 'x' }, 'write')).kind, 'continue')
+  assert.equal((await h.pre({ path: 'secrets/token.txt', content: 'x' }, 'write')).kind, 'deny')
 })
 
 add('S36', 'P0：真实验收与重做建立新证据窗口', ['unit-done', 'review-revise', 'review-done'], async h => {
@@ -753,12 +750,18 @@ add('S36', 'P0：真实验收与重做建立新证据窗口', ['unit-done', 'rev
   const old = await h.exec('node -e "console.log(1)"')
   const args = { unit: 'a', outcome: 'complete', summary: '项目检查通过', next: '等待验收', claims: [{ statement: '项目检查通过', execution: { callId: old } }] }
   await h.tool('work_submit', args)
-  await assert.rejects(h.tool('work_control', { operation: 'resume' }), /refuses/)
+  assert.equal((await h.tool('work_control', { operation: 'resume' })).unchanged, true)
   await h.say('不通过，需要修改')
-  await assert.rejects(h.tool('work_control', { operation: 'accept', text: '不通过，需要修改' }), /refuses|rework/)
-  await h.tool('work_control', { operation: 'rework', text: '不通过，需要修改' })
-  await assert.rejects(h.tool('work_submit', args), /window|before|recorded|evidence/)
-  const fresh = await h.exec('node -e "console.log(2)"')
+  // 用户说了不：accept 什么都不动，退回才算。
+  assert.equal((await h.tool('work_control', { operation: 'accept' })).unchanged, true)
+  await h.tool('work_control', { operation: 'rework' })
+  // 重做之后改了东西：旧的检查不算。检查是红的就退回；插件交付时自己跑，模型引用哪次都一样。
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.exec('echo "export const a = 2" > a.js')
+  await assert.rejects(h.tool('work_submit', args), /交付前插件在项目里跑了 `npm test`，没通过/)
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  const fresh = await h.exec('npm test')
   await h.tool('work_submit', { ...args, claims: [{ statement: '重新检查通过', execution: { callId: fresh } }] })
   await h.say('验收通过，这一版收下')
   await h.tool('work_control', { operation: 'accept', text: '验收通过，这一版收下' })
@@ -791,9 +794,9 @@ add('S37', 'P1：统一记录五种信息，真实未决才等待', ['ask', 'alt
   assert.equal(resolved.waiting, null)
   assert.equal(resolved.continueAuthorized, true)
   await h.tool('work_control', { operation: 'goal', text: '旧入口仍可修订目标' })
-  const before = JSON.stringify(h.host.tables)
-  await assert.rejects(h.tool('work_control', { operation: 'record', entries: [{ kind: 'goal', text: '不得落盘' }, { kind: 'invalid' }] }), /record kind/)
-  assert.equal(JSON.stringify(h.host.tables), before)
+  // An empty, unknown entry is dropped; the rest of the batch lands.
+  await h.tool('work_control', { operation: 'record', entries: [{ kind: 'goal', text: '照样落盘' }, { kind: 'invalid' }] })
+  assert.equal((await h.board()).task?.goalRevision, 3)
 })
 add('S38', 'P1：真实环境观测直接可用，失效后需要新证据', ['env'], async h => {
   await h.cmd('start 检查环境')
@@ -808,29 +811,16 @@ add('S38', 'P1：真实环境观测直接可用，失效后需要新证据', ['e
   assert.equal(h.receipts.length, count)
   await h.tool('work_env', { operation: 'stale', key: 'port' })
   assert.equal((await h.tool('work_env', { operation: 'list' })).digest.usable, 0)
-  await assert.rejects(h.tool('work_env', args), /fresh observation/)
+  // A stale fact cited again is kept as a candidate until fresh proof arrives.
+  assert.match((await h.tool('work_env', args)).tellUser, /过期.*先记成候选/)
   await h.tool('work_env', { ...args, callId: await h.exec(command) })
-  await assert.rejects(h.tool('work_env', { ...args, kind: 'blocked' }), /protected rules/)
+  assert.match((await h.tool('work_env', { ...args, kind: 'blocked' })).tellUser, /规则要用户确认/)
   await h.say('预览地址 http://localhost:4321')
   await h.tool('work_env', { operation: 'observe', kind: 'gui', key: 'preview', value: 'http://localhost:4321', quote: '预览地址 http://localhost:4321' })
   const env = await readEnv(h.state.project)
   assert.equal(env.gui[0].source.by, 'user')
   assert.match((await h.tool('work_env', { operation: 'list' })).digest.gui[0], /observed; user;/)
 })
-add('S39', 'P1：无计划也有独立方法，无二十次调用催账', ['read-doc'], async h => {
-  await h.cmd('start 优化一下并交接探针')
-  await h.tool('work_start', { request: '优化一下并交接探针', mode: 'do', scope: ['.'], acceptance: ['能运行'] })
-  await h.step()
-  for (const event of ['ambiguity', 'impact', 'release']) assert.ok(h.hints.some(row => row.summary === `auto-dev-v3 method ${event}`))
-  const count = h.hints.filter(row => /method /.test(row.summary)).length
-  await h.step()
-  assert.equal(h.hints.filter(row => /method /.test(row.summary)).length, count)
-  for (let i = 0; i < 21; i++) await h.exec('node -e "console.log(1)"')
-  await h.step()
-  assert.equal(h.hints.some(row => /settle-up|no-active-unit/.test(row.summary)), false)
-  assert.equal((await h.board()).task.state, 'active')
-})
-
 add('S40', 'P2：新 build 按 do 无计划交付，已有叶子与 PM 仍约束收尾', ['task-done', 'unit-done', 'review-done'], async h => {
   await h.cmd('start 执行无计划探针')
   const started = await h.tool('work_start', { request: '执行无计划探针', mode: 'build', acceptanceMode: 'auto', scope: ['.'], acceptance: ['探针通过'] })
@@ -903,51 +893,346 @@ add('S42', 'P2：新复盘进入工程记忆，旧历史只读，后续开工取
   assert.match(JSON.stringify(next), /legacy-unverified/)
 })
 
-add('S44', '交付带人话提醒：没跑项目检查的完成回执自带那一句，记录里也留着', ['unit-done'], async h => {
-  await h.cmd('start 改报告标题')
-  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
-  await h.tool('work_start', { request: '改报告标题', mode: 'do', acceptanceMode: 'auto', scope: ['.'], acceptance: ['标题已改'] })
-  await h.tool('work_plan', { operation: 'set', units: [{ id: 'a', goal: '改标题', scope: ['.'], acceptance: ['标题已改'] }, { id: 'b', goal: '改正文', scope: ['.'], acceptance: ['正文已改'] }] })
-  await h.tool('work_plan', { operation: 'activate', unit: 'a' })
-  await h.exec('echo title > report.md')
-  const look = await h.exec('cat report.md')
-  await h.tool('work_submit', { unit: 'a', outcome: 'complete', summary: '标题改好了', next: '改正文', claims: [{ statement: '标题已改', execution: { callId: look } }] })
-  const done = h.receipts.find(row => row.form === 'unit-done')
-  assert.match(done.warnings?.[0] ?? '', /^没跑项目检查/)
-  const entry = Object.values(h.host.tables.tasks)[0].ledger.at(-1)
-  assert.deepEqual(entry.reminders, done.warnings)
-  assert.equal(entry.claims[0].execution.callId, look)
+// 真模型（实跑会话 949cce92）跑测试的原样写法：带 cd 前缀、管道截尾、echo 退出码。
+// 退出码被 tail / echo 吞掉，失败只留在输出里。
+const readmeTest = h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ name: 'demo', type: 'module', scripts: { test: 'node --test' } }))
+  mkdirSync(join(h.state.project, 'test'), { recursive: true })
+  writeFileSync(join(h.state.project, 'test', 'readme.test.mjs'), "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { readFileSync } from 'node:fs'\ntest('readme says fixed', () => assert.match(readFileSync('README.md', 'utf8'), /fixed/))\n")
+}
+
+add('S53', '插件收尾：改完说做完了就是交付，G1 由插件自己跑检查把关；模型不用记得调交付工具', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  // 计划写成 steps 也是计划（v27 写成 steps 被悄悄清空，面板与对话对不上）。
+  await h.tool('work_plan', { operation: 'set', steps: [{ id: 'u1', title: '加导出' }] })
+  assert.ok((await h.board()).units.some(row => row.id === 'u1' && row.goal === '加导出'))
+  // 宿主在执行前拒掉的编辑什么都没改：磁盘没变，说「改好了」也不算交付（v27 #90–#108）。
+  h.state.log.push({ type: 'tool/call', data: { callId: 'edit-refused', name: 'edit', arguments: { path: 'a.js' } } })
+  h.state.log.push({ type: 'tool/result', data: { message: { toolCallId: 'edit-refused', isError: true, content: [{ type: 'text', text: 'cannot modify a.js: file has not been read' }] } } })
+  assert.equal((await h.stop('改好了。')).length, 0)
+  assert.equal((await h.board()).task.state, 'active')
+  await h.exec('echo "export const a = 1" > a.js')
+  // 磁盘变了、说做完：先给一次交付条件句（回合自己结束时看不到工具结果，v33 perf/refactor），
+  const told = await h.stop('改好了。')
+  assert.equal(told.length, 1)
+  assert.match(told[0].content[0].text, /交付前对照一下/)
+  assert.doesNotMatch(told[0].content[0].text, /如果是重构|如果这次是提速/, '交付卡不再带提速、重构两句')
+  // 用户也要看得到：胶囊，不是隐形的 notice（v34 违反 1）。
+  assert.equal(told[0].source?.form, 'read-doc', JSON.stringify(told[0].source))
+  // 再说做完：插件自己跑检查，红就让回合接着走一次，一条规则 + 一个过关动作。
+  const first = await h.stop('改好了。')
+  assert.equal(first.length, 1)
+  assert.match(first[0].content[0].text, /交付诚实.*没通过[\s\S]*过关：修好让它通过，再交/)
+  assert.doesNotMatch(first[0].content[0].text, /work_\w+|operation/)
+  assert.equal((await h.board()).task.state, 'active')
+  assert.equal((await h.stop('改好了。')).length, 0, '同一份磁盘只提醒一次，不拖住回合')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  // 结尾在问用户：是在等人，不是交付。
+  assert.equal((await h.stop('导出名用 a 还是 value？')).length, 0)
+  assert.equal((await h.board()).task.state, 'active')
+  const before = h.receipts.length
+  assert.equal((await h.stop('改好了。')).length, 0)
+  assert.equal((await h.board()).task.state, 'review_ready')
+  assert.equal(h.calls.some(call => call.name === 'work_submit'), false)
+  // 收尾交付当场进对话，面板也认（v28：dock 停在「未开始」，交付卡等一个不会来的下一步）。
+  assert.ok(h.receipts.slice(before).some(row => row.form === 'review' || row.form === 'task-done' || row.form === 'unit-done'), JSON.stringify(h.receipts.slice(before).map(row => row.form)))
+  const status = await h.board()
+  const panel = boardOf(syncState({ ...h.state.log.reduce(foldBoard, null), sessionId: h.state.sessionId },
+    { taskFor: () => ({ task: status.task, plan: { units: [] } }) }))
+  assert.equal(panel.counting.label, '已交付')
+}, { git: true })
+
+add('S58', '没建计划的小改动：插件收尾交付当场问「要不要看一眼」，回合在这里结束也看得到（v30 fix：静默交付）', ['review'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  await h.exec('echo "export const a = 1" > a.js')
+  const before = h.receipts.length
+  assert.equal((await h.stop('改好了。')).length, 1, '交付条件句先说一次')
+  assert.equal((await h.stop('改好了。')).length, 0)
+  assert.equal((await h.board()).task.state, 'review_ready')
+  const forms = h.receipts.slice(before).map(row => row.form)
+  assert.equal(forms.filter(form => form === 'review').length, 1, JSON.stringify(forms))
+}, { git: true })
+
+add('S59', '第一次写文件：「动手前」的条件句此刻出一次（不在开工堆着）；用户开工后说过话就不再提「先复述」（v30 clarify）', [], async h => {
+  await h.cmd('start 列表要能按标签过滤，删除要二次确认，导出加日期，顺便改下帮助文案', { deliverFollowup: true })
+  const before = h.hints.length
+  await h.write('a.js', 'export const a = 1\n')
+  const first = h.hints.slice(before).filter(row => row.summary === 'dsh-auto-dev first write')
+  assert.equal(first.length, 1)
+  assert.match(first[0].text, /先停下，对用户复述/)
+  // 复述的格式是约定，不校验：固定开头、更省事的做法、只问一个、停下（v36 clarify 没停）。
+  assert.match(first[0].text, /「\*\*我理解的要求：\*\*」[\s\S]*「\*\*更省事的做法：\*\*」[\s\S]*只问一个[\s\S]*结束这一回合/)
+  assert.match(first[0].text, /一次只改一处/)
+  await h.write('b.js', 'export const b = 1\n')
+  assert.equal(h.hints.filter(row => row.summary === 'dsh-auto-dev first write').length, 1, '每个任务只说一次')
+}, { git: true })
+
+add('S60', '交付条件句不论哪条路交付都是一张胶囊、每任务一次；只写插件自己的 .auto-dev/ 文件不算改了项目（v36 feature / survey）', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.cmd('start 先帮我看懂这个项目，结论记下来', { deliverFollowup: true })
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  await h.write('.auto-dev/project-domain.md', '# 摸底\n- 数据存在 notes.json\n')
+  assert.equal(h.hints.filter(row => row.summary === 'dsh-auto-dev first write').length, 0, '插件自己的文件不是「改了第一个文件」')
+  await h.tool('work_submit', { outcome: 'complete', summary: '看完了，结论写进 domain' })
+  assert.equal(h.hints.filter(row => row.summary === 'dsh-auto-dev delivery').length, 0, '磁盘上项目没变，就没有交付条件句')
+}, { git: true })
+
+add('S61', '模型自己调工具交付：交付条件句也是胶囊（不是只塞进工具结果），之后回合结束不再说第二次', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  await h.write('a.js', 'export const a = 1\n')
+  const result = await h.tool('work_submit', { outcome: 'complete', summary: '加好了' })
+  assert.equal((result.warnings ?? []).some(line => /如果是重构/.test(line)), false, '条件句不再藏在工具结果里')
+  await h.step()
+  const told = h.receipts.filter(row => row.form === 'read-doc' && /交付前对照一下/.test(JSON.stringify(row)))
+  assert.equal(told.length, 1, JSON.stringify(h.receipts.map(row => row.form)))
+  assert.equal((await h.stop('改好了。')).length, 0, '回合结束不再说第二次')
+}, { git: true })
+
+add('S62', '检查的截短写法：带 set -o pipefail 的 tail 照样记红绿；不带 pipefail 的 tail 退出码是 tail 的，不算（v36 模型总接 | tail）', ['read-doc', 'save'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
+  await h.exec('set -o pipefail; npm test 2>&1 | tail -5')
+  await h.step()
+  // 不带 pipefail：这一次的「绿」是 tail 的，插件不认，不能把红记成绿打断连续红。
+  await h.exec('npm test 2>&1 | tail -5')
+  await h.step()
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '第 1 次红不说话')
+  await h.exec('set -o pipefail; npm test 2>&1 | tail -20')
+  await h.step()
+  const fix = h.receipts.filter(row => row.form === 'read-doc')
+  assert.equal(fix.length, 1, '约定的截短写法连续第 2 次红出排查卡')
+  assert.equal(fix[0].title, '修 bug · 排查')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec('set -o pipefail; npm test 2>&1 | tail -20')
+  await h.step()
+  assert.ok(h.receipts.some(row => row.form === 'save' && /修通/.test(row.line)), '截短写法转绿也存修通')
 })
 
-add('S43', '方法提示不刷屏：连续改文件只提醒一次验证，同一命令反复失败只提醒一次排查', ['read-doc'], async h => {
-  await h.cmd('start 整理报告')
-  await h.tool('work_start', { request: '整理报告', mode: 'do', scope: ['.'], acceptance: ['报告可读'] })
-  const count = key => h.hints.filter(row => row.summary === `auto-dev-v3 method ${key}`).length
-  // 研究会话里常见的节奏：一条 sed、一次重定向、一次脚本写文件，中间夹着检查。
-  for (const command of ['echo a > report.md', 'sed -i.bak s/a/b/ report.md', 'node -e "require(\'fs\').writeFileSync(\'x.txt\',\'1\')" > log.txt']) {
-    await h.exec(command)
-    await h.step()
-    await h.exec('cat report.md')
-    await h.step()
-  }
-  assert.equal(count('verification'), 1, '提交前的连续写只该提醒一次验证')
-  const check = await h.exec('cat report.md')
-  await h.tool('work_submit', { outcome: 'partial', summary: '报告初稿', next: '补结论', claims: [{ statement: '报告已写出', execution: { callId: check } }] })
+add('S63', 'F-fix：模型红两次后改用组合命令验证、自己没再原样跑检查；交付时插件 G1 自跑转绿，这次也算修通，没写复盘照样 G4 拦一次（v37 fix）', ['read-doc', 'save', 'blocked-call'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
+  for (let i = 0; i < 2; i++) { await h.exec('set -o pipefail; npm test 2>&1 | tail -40'); await h.step() }
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').at(-1)?.title, '修 bug · 排查')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec('cd . && W=$(mktemp -d) && npm test')
   await h.step()
-  assert.equal(count('verification'), 1, '提交已经覆盖了之前的改动，提交后不该再提醒')
-  await h.exec('echo c >> report.md')
+  const args = { unit: 'f', outcome: 'complete', summary: '修好了' }
+  await assert.rejects(h.tool('work_submit', args), /incidents\.md 没有变化/)
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## add 重复 id\n根因：…\n')
+  await h.tool('work_submit', args)
+  assert.equal(h.receipts.filter(row => row.form === 'blocked-call').length, 1, '写了复盘就过，只拦一次')
+}, { checkpoints: true, git: true })
+
+add('S64', '第一次写文件：开工原话有 3 句以上、用户还没说过话 → 卡上逐字带出这几句（不判哪句是要求）；用户回过话后的新任务不带（v37 clarify 没复述）', [], async h => {
+  await h.cmd('start notes 想加几个东西：list 能按关键词过滤；rm 删不存在的 id 不该说 removed；add 空文本应该拒绝。验收：npm test 全过', { deliverFollowup: true })
+  const before = h.hints.length
+  await h.write('a.js', 'export const a = 1\n')
+  const first = h.hints.slice(before).find(row => row.summary === 'dsh-auto-dev first write')
+  assert.match(first.text, /事实：开工原话断开是 3 句[\s\S]*「rm 删不存在的 id 不该说 removed」/)
+  assert.doesNotMatch(first.text, /「验收/, '验收那句不算')
+}, { git: true })
+
+add('S66', 'D2 跨项目：项目 A 交付时复盘原文拷进 ~/.dsh-auto-dev（测试里是临时目录）；项目 B 开工卡带出 A 的最新一条，标明来自哪个项目；A 自己开工不带自己的那份', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## 旧的一条\n根因：甲\n\n## rm 后 add 重复 id\n根因：id 取了数组长度\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.write('a.js', 'export const a = 1\n')
+  await h.exec('npm test')
   await h.step()
-  assert.equal(count('verification'), 2, '提交之后再改文件是新的一段，要再提醒')
-  const probe = 'node probe.cjs'
-  writeFileSync(join(h.state.project, 'probe.cjs'), 'process.exit(1)')
-  for (let i = 0; i < 4; i += 1) { await h.exec(probe); await h.step() }
-  assert.equal(count('debug'), 1, '同一条命令连续失败只提醒一次排查')
-  writeFileSync(join(h.state.project, 'probe.cjs'), 'process.exit(0)')
-  await h.exec(probe)
-  writeFileSync(join(h.state.project, 'probe.cjs'), 'process.exit(1)')
-  await h.exec(probe)
+  await h.tool('work_submit', { outcome: 'complete', summary: '修好了' })
+  const shared = readdirSync(join(process.env.DSH_AUTO_DEV_HOME, 'incidents'))
+  assert.ok(shared.length >= 1, '交付后团队目录里有这份复盘')
+  const other = join(h.state.project, '..', 'project-b')
+  mkdirSync(other, { recursive: true })
+  writeFileSync(join(other, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  const second = await open({ project: other, sessionId: 'session-s66-b' })
+  const b = helpers(second.host, second.state)
+  await b.cmd('start 给 notes 加 search', { deliverFollowup: true })
+  const brief = b.hints.map(row => row.text).join('\n')
+  assert.match(brief, /别的项目留下的复盘[\s\S]*project\][\s\S]*rm 后 add 重复 id/, 'B 的开工卡带 A 的最新一条，标项目路径')
+  assert.doesNotMatch(brief, /旧的一条/, '每个项目只带最新一条')
+  for (const verb of b.state.commands) h.state.commands.push(verb)
+}, { git: true })
+
+add('S65', '交接：另一个会话接手时，接手卡读回任务记录里的硬事实——开工原话、之后用户的话、最后一次原样检查与退出码、开工以来改过的文件、存档；模型不填任何东西', ['handoff'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'console.log("not ok 2 - search milk")\nprocess.exit(1)\n')
+  await h.cmd('start 给 notes 加 search 命令', { deliverFollowup: true })
+  await h.say('搜索不区分大小写')
+  await h.write('a.js', 'export const search = () => []\n')
+  await h.exec('npm test')
   await h.step()
-  assert.equal(count('debug'), 2, '这条命令跑通过之后再失败，是新问题，要再提醒')
+  await h.tool('work_control', { operation: 'pause', reason: '换窗口' })
+  const second = await open({ project: h.state.project, sessionId: 'session-s65', tables: h.host.tables })
+  const other = helpers(second.host, second.state)
+  await other.cmd('adopt')
+  for (const verb of other.state.commands) h.state.commands.push(verb)
+  await other.step()
+  for (const receipt of other.receipts) h.receipts.push(receipt)
+  const card = other.hints.find(row => row.summary.startsWith('dsh-auto-dev handoff'))
+  assert.ok(card, '接手卡到了模型')
+  assert.match(card.text, /事实：开工原话：「给 notes 加 search 命令」/)
+  assert.match(card.text, /事实：之后用户说过：「搜索不区分大小写」/)
+  assert.match(card.text, /事实：最后一次项目检查 `npm test`：退出码非 0，输出末尾：[\s\S]*not ok 2 - search milk/)
+  assert.match(card.text, /事实：开工以来改过的文件：.*a\.js/)
+  assert.doesNotMatch(card.text, /继续 task-/, '插件自己的「继续」不算用户的话')
+  assert.doesNotMatch(card.text, /operation:|work_\w+/)
+}, { checkpoints: true, git: true })
+
+add('S69', '团队约定：~/.dsh-auto-dev/conventions.md（用户自己写）开工卡原样带出，标明项目约定优先；没有这个文件就没有这一行', [], async h => {
+  const file = join(process.env.DSH_AUTO_DEV_HOME, 'conventions.md')
+  writeFileSync(file, '- 实跑配置一律 rig- 开头，业务名不带前缀\n')
+  try {
+    await h.cmd('start 给 notes 加 search', { deliverFollowup: true })
+    const brief = h.hints.map(row => row.text).join('\n')
+    assert.match(brief, /团队约定（用户写的原文；跟这个项目自己的约定冲突时，以项目为准）：\n- 实跑配置一律 rig- 开头/)
+  } finally { rmSync(file, { force: true }) }
+}, { git: true })
+
+add('S68', '两次运行：项目里已有上次写的复盘，这次原样红两次 → 排查卡带 incidents.md 原文（实跑里模型常带 `cd … &&`，走不到，改由场景验）', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## rm 后 add 重复 id\n根因：id 取了数组长度\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  for (let i = 0; i < 2; i++) { await h.exec('npm test'); await h.step() }
+  const card = h.hints.find(row => /连续第 2 次退出码非 0/.test(row.text))
+  assert.ok(card, '第 2 次红出排查卡')
+  assert.match(card.text, /incidents\.md 最近几条（原文）：[\s\S]*根因：id 取了数组长度/)
+}, { git: true })
+
+add('S67','交接缺事实就不出那一行：检查跑在 `cd … && npm test` 里（不是原样命令，记录里没有）→ 接手卡不写「还没有跑过项目检查」（v40）', ['handoff'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  await h.cmd('start 给 notes 加 search 命令', { deliverFollowup: true })
+  await h.write('a.js', 'export const search = () => []\n')
+  await h.exec(`cd ${h.state.project} && npm test`)
+  await h.step()
+  await h.tool('work_control', { operation: 'pause', reason: '换窗口' })
+  const second = await open({ project: h.state.project, sessionId: 'session-s67', tables: h.host.tables })
+  const other = helpers(second.host, second.state)
+  await other.cmd('adopt')
+  for (const verb of other.state.commands) h.state.commands.push(verb)
+  await other.step()
+  for (const receipt of other.receipts) h.receipts.push(receipt)
+  const card = other.hints.find(row => row.summary.startsWith('dsh-auto-dev handoff'))
+  assert.ok(card, '接手卡到了模型')
+  assert.doesNotMatch(card.text, /项目检查/, '记录里没有原样检查：整行不出，不写否定句')
+  assert.match(card.text, /事实：开工以来改过的文件：.*a\.js/)
+}, { checkpoints: true, git: true })
+
+add('S55', 'F-fix（第三条路）：只认一字不差的检查与退出码；第 2 次红出排查卡并存修前，转绿存修通并提醒落盘，没写复盘交付被 G4 拦一次', ['read-doc', 'save', 'blocked-call'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  const brief = h.hints.map(row => row.text).join('\n')
+  assert.match(brief, /项目检查是 `npm test`：跑就写 `npm test`；要截短输出就写 `set -o pipefail; npm test/, '开工约定检查写法')
+  assert.match(brief, /如果用户要的是紧急止血/, '条件句由模型判断是否适用')
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
+  await h.exec('npm test')
+  await h.step()
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '第 1 次红不说话')
+  // 包了管道的不是项目检查：插件看不见，宁可漏也不猜。
+  await h.exec('npm test | tail -3')
+  await h.step()
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '管道写法不算')
+  // 临时副本里看新测试红（F-test）：不是项目检查，红两次也不出排查卡（v35 实跑走不到，移到这里验）。
+  const copy = mkdtempSync(join(tmpdir(), 'dsh-copy-'))
+  writeFileSync(join(copy, 'package.json'), JSON.stringify({ scripts: { test: 'node -e "process.exit(1)"' } }))
+  for (let i = 0; i < 2; i++) { await h.exec(`cd ${copy} && npm test`); await h.step() }
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '临时副本的红不算项目检查')
+  await h.exec('npm test')
+  await h.step()
+  const fix = h.receipts.filter(row => row.form === 'read-doc')
+  assert.equal(fix.length, 1)
+  assert.equal(fix[0].title, '修 bug · 排查')
+  assert.match(fix[0].text, /`npm test` 连续第 2 次退出码非 0/)
+  assert.match(fix[0].text, /按可能性排序/)
+  assert.ok(h.receipts.some(row => row.form === 'save' && /修之前/.test(row.line)), '修前存档')
+  await h.exec('npm test')
+  await h.step()
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 1, '同一段红只出一次')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec('npm test')
+  await h.step()
+  const fixed = h.receipts.filter(row => row.form === 'read-doc').at(-1)
+  assert.equal(fixed.title, '修通 · 记一笔')
+  assert.match(fixed.text, /红了 3 次之后退出码 0/)
+  assert.ok(h.receipts.some(row => row.form === 'save' && /修通/.test(row.line)), '修通存档')
+  const args = { unit: 'f', outcome: 'complete', summary: '修好了' }
+  await assert.rejects(h.tool('work_submit', args), /复盘落盘|incidents\.md 没有变化[\s\S]*过关：把这次写进/)
+  assert.equal(h.receipts.at(-1).form, 'blocked-call')
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## add 重复 id\n症状：…\n根因：…\n')
+  await h.tool('work_submit', args)
+  assert.equal(h.receipts.filter(row => row.form === 'blocked-call').length, 1, '写了复盘就过，只拦一次')
+}, { checkpoints: true, git: true })
+
+add('S56', '删除 · 还有引用：磁盘上消失的文件仍被引用才出卡（读磁盘，不读 rm 文本）；被测程序的 rm 子命令不算', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 1' } }))
+  writeFileSync(join(h.state.project, 'store.js'), 'export const load = () => 1\n')
+  writeFileSync(join(h.state.project, 'cli.js'), "import { load } from './store.js'\nconsole.log(load())\n")
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  await h.cmd('start 整理存储层', { deliverFollowup: true })
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'r', goal: '整理' }] })
+  await h.exec('node -e "console.log(\'rm 999\')"')
+  await h.exec('npm test')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '没东西消失就不说话')
+  await h.exec('node -e "require(\'fs\').unlinkSync(\'store.js\')"')
+  await h.exec('npm test')
+  const card = h.receipts.filter(row => row.form === 'read-doc')
+  assert.equal(card.length, 1)
+  assert.equal(card[0].title, '删除 · 还有引用')
+  assert.match(card[0].text, /这些文件里还出现「store」：cli\.js/)
+  await h.exec('npm test')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 1, '同一个文件只说一次')
+}, { git: true })
+
+add('S57', '开工只给条件句和这个项目的原文：复盘与口径逐字带出，不按关键词出方法卡', [], async h => {
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
+  writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## 导出乱码\n根因：没写 BOM\n')
+  writeFileSync(join(h.state.project, '.auto-dev/project-domain.md'), '# 口径\n- 金额一律分为单位\n')
+  await h.cmd('start 这个导出很慢，顺便重构一下，再补点测试', { deliverFollowup: true })
+  const brief = h.hints.map(row => row.text).join('\n')
+  assert.match(brief, /根因：没写 BOM/)
+  assert.match(brief, /金额一律分为单位/)
+  assert.match(brief, /如果用户要的是紧急止血/)
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '说慢、说重构都不出关键词卡')
+  await h.say('先不做了')
+  await h.tool('work_control', { operation: 'cancel', reason: '用户说先不做了' })
+  assert.equal((await h.board()).task?.state ?? 'cancelled', 'cancelled')
+})
+
+add('S47', 'G2 只认精确词表：删临时目录、删项目目录都不弹授权（存档与删除卡兜底）；git reset --hard 要问，人点的选项算回话', ['blocked-call'], async h => {
+  await h.cmd('start 手动验证 CLI')
+  await h.tool('work_start', { request: '手动验证 CLI', mode: 'do', scope: ['.'], acceptance: ['CLI 能跑'] })
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'v1', goal: '验证', scope: ['.'], acceptance: ['能跑'] }] })
+  // 实测会话 c9588d6f 里被拦下的原命令：只删 mktemp 建的目录和其中一个文件。
+  const verify = 'tmp=$(mktemp -d); export NOTES_FILE="$tmp/notes.json"\necho one > "$tmp/notes.json"\nrm -f "$tmp/.notes-seq"; ls "$tmp"\nrm -rf "$tmp"'
+  assert.equal((await h.pre(verify)).kind, 'continue', '清理 mktemp 临时目录不该要授权')
+  assert.equal((await h.pre('rm -rf "docs/old build"')).kind, 'continue', '插件不猜 rm 删的是什么')
+  assert.equal((await h.pre('echo "git reset --hard"')).kind, 'continue', '引号里的字是数据')
+  const action = 'git reset --hard HEAD~1'
+  assert.equal((await h.pre(action)).kind, 'deny', '精确词表里的要先问')
+  await h.tool('work_plan', { operation: 'list' })
+  assert.match(h.receipts.findLast(row => row.form === 'blocked-call')?.title ?? '', /不可逆/)
+  h.state.log.push({ type: 'tool/call', data: { callId: 'confirm_cmd', name: 'ask_user_question', arguments: {
+    questions: [{ id: 'confirm_cmd', question: `是否允许执行：${action}`, options: [{ label: '允许执行上述命令（推荐）' }, { label: '不执行' }] }] } } })
+  h.state.log.push({ type: 'tool/result', data: { message: { toolCallId: 'confirm_cmd',
+    content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'confirm_cmd', selected: ['允许执行上述命令（推荐）'] }] }) }] } } })
+  assert.equal((await h.pre(action)).kind, 'continue', '点过「允许」之后放行')
 })
 
 for (const scenario of scenarios) {
@@ -991,7 +1276,9 @@ for (const scenario of scenarios) {
     goalRevision: board.task?.goalRevision ?? board.goalRevision ?? 0,
   } : null
   if (golden) golden.push({ id: scenario.id, trace: h.trace, board, tables: state.tables, error })
-  rows.push({ id: scenario.id, title: scenario.title, must: scenario.must, forms, commands: state.commands, operations, tools: h.calls.map(call => call.name), receipts: h.receipts, ...(h.hints.length ? { hints: h.hints } : {}), panel, panelKeys: board ? Object.keys(board) : [], missing, ...(error ? { error } : {}) })
+  const cards = h.trace.map(({ message }) => message).filter(message => message?.source?.summary?.startsWith?.('dsh-auto-dev'))
+    .map(message => ({ summary: message.source.summary, text: Array.isArray(message.content) ? message.content.map(part => part.text ?? '').join('') : String(message.content ?? '') }))
+  rows.push({ cards, id: scenario.id, title: scenario.title, must: scenario.must, forms, commands: state.commands, operations, tools: h.calls.map(call => call.name), receipts: h.receipts, ...(h.hints.length ? { hints: h.hints } : {}), panel, panelKeys: board ? Object.keys(board) : [], missing, ...(error ? { error } : {}) })
   const mark = error ? 'ERR' : missing.length ? 'MISS' : 'ok'
   console.log(`${mark.padEnd(4)} ${scenario.id} ${scenario.title} → ${forms.join(', ') || '(none)'}${missing.length ? `  缺 ${missing.join(',')}` : ''}${error ? `  ✗ ${error}` : ''}`)
 }
@@ -1027,6 +1314,16 @@ mkdirSync(outFile.includes('/') ? outFile.slice(0, outFile.lastIndexOf('/')) : '
 // like the run it came from, and an unchanged run leaves nothing to commit.
 writeFileSync(outFile, stabilise(JSON.stringify(rows, null, 2), (id, n) => `${/^[a-z]+-/.exec(id)?.[0] ?? 'id-'}${n}`))
 const bad = rows.filter(row => row.missing.length || row.error)
+
+// ——— 教填参数闸 ———
+// Every card the plugin put in front of the model, in every scenario: none may
+// teach a tool call or a field (设计约定「绝对禁忌」). Same words the replay counts.
+const teaching = rows.flatMap(row => (row.cards ?? []).map(card => ({ id: row.id, summary: card.summary, fills: fillsIn(card.text) })))
+  .filter(row => row.fills.length)
+if (teaching.length) {
+  console.log('\n教填参数的卡 → 卡片只说发生了什么和一句做法，参数归工具描述：')
+  for (const row of teaching) console.log(`  ${row.id} ${row.summary}：${row.fills.join('、')}`)
+}
 
 // ——— 覆盖闸门 ———
 // The bench is the only thing that sees the products of the control plane, so a
@@ -1082,4 +1379,4 @@ console.log(`覆盖：${counts.forms[0]}/${counts.forms[1]} form · ${counts.ver
   + `${counts.tools[0]}/${counts.tools[1]} 工具 · `
   + `${counts.operations[0]}/${counts.operations[1]} 分支 · `
   + `${counts.panel[0]}/${counts.panel[1]} 面板字段${coverageBad ? '（有缺口）' : ''}`)
-process.exit(bad.length || coverageBad ? 1 : 0)
+process.exit(bad.length || coverageBad || (!only && teaching.length) ? 1 : 0)

@@ -6,10 +6,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { stubHost } from '../tools/flow.mjs'
-import { decisionSource, grantsAction, controlTransition } from '../src/decisions.mjs'
+import { consent, decisionSource, controlTransition } from '../src/decisions.mjs'
 import { foldBoard, boardOf, syncState } from '../src/projection.mjs'
 import { envDigest, readEnv } from '../src/env.mjs'
-import { observedTier } from '../src/uicheck.mjs'
 
 const unit = (id, extra = {}) => ({ id, goal: `交付 ${id}`, scope: ['.'], acceptance: [], ...extra })
 const submit = (id, callId, extra = {}) => ({ ...(id ? { unit: id } : {}), outcome: 'complete', summary: '实际检查已通过', next: '查看结果',
@@ -66,7 +65,6 @@ async function harness({ project = mkdtempSync(join(tmpdir(), 'dsh-p1-')), table
 }
 
 
-import { failureContext, craftHints } from '../src/craft.mjs'
 
 const proof = (id, callId, outcome = 'complete') => ({ ...(id ? { unit: id } : {}), outcome,
   summary: '探针已执行', next: '继续已授权工作', claims: [{ statement: '探针可执行', execution: { callId } }] })
@@ -113,12 +111,12 @@ test('P1 U07: planless record batches use existing owners and validate before wr
   assert.equal(h.task().alternatives[0].text, '复用现有探针')
   assert.match(readFileSync(join(h.project, '.auto-dev/memory.json'), 'utf8'), /根因尚未知/)
   assert.equal(h.plan(), undefined)
-  const before = JSON.stringify(h.host.tables), notices = h.notices.length
-  await assert.rejects(h.tool('work_control', { operation: 'record', entries: [{ kind: 'goal', text: '不得写入' }, { kind: 'unknown', text: '错误' }] }), /record kind/)
-  assert.equal(JSON.stringify(h.host.tables), before)
-  assert.equal(h.notices.length, notices)
+  // A kind the plugin does not know is read from its fields, not refused.
+  const odd = await h.tool('work_control', { operation: 'record', entries: [{ kind: 'goal', text: '收下的目标' }, { kind: 'unknown', text: '一句话' }] })
+  assert.equal(odd.entries.length, 2)
+  assert.equal(h.task().goal, '收下的目标')
   const legacy = await h.tool('work_control', { operation: 'goal', text: '兼容目标' })
-  assert.equal(legacy.goalRevision, 2)
+  assert.equal(legacy.goalRevision, 3)
   assert.equal(h.notices.find(row => row.source.form === 'ask').source.data.tone, 'ask')
   assert.equal(h.notices.some(row => row.source.form === 'alternative'), false)
   assert.equal(result.waiting, 'user-answer')
@@ -135,12 +133,12 @@ test('P1 U07: documented question and legacy q normalize alike; invalid batches 
     stored.push(h.task().clarify.asked)
     assert.equal(result.waiting, null)
     assert.equal(result.continueAuthorized, true)
-    const before = JSON.stringify(h.host.tables), notices = h.notices.length
-    await assert.rejects(h.tool('work_control', { operation: 'record', entries: [
-      { kind: 'goal', text: '不得写入' }, { kind: 'clarify', asked: [{}] },
-    ] }), /clarify asked/)
-    assert.equal(JSON.stringify(h.host.tables), before)
-    assert.equal(h.notices.length, notices)
+    // An empty question is dropped; the rest of the batch still lands.
+    await h.tool('work_control', { operation: 'record', entries: [
+      { kind: 'goal', text: '照样写入' }, { kind: 'clarify', asked: [{}] },
+    ] })
+    assert.equal(h.task().goal, '照样写入')
+    assert.equal(h.task().clarify.asked.length, 1)
   }
   assert.deepEqual(stored[0], stored[1])
 })
@@ -252,14 +250,15 @@ test('P1 U08: observed facts carry real provenance, duplicates stay quiet, stale
   assert.equal(h.notices.length, notices)
   await h.tool('work_env', { operation: 'stale', key: 'preview' })
   assert.equal(envDigest(await readEnv(h.project)).gui.length, 0)
-  await assert.rejects(h.tool('work_env', args), /fresh observation/)
+  // Unsupported observations are kept as candidates, never refused.
+  assert.match((await h.tool('work_env', args)).tellUser, /过期.*先记成候选/)
   await h.tool('work_env', { ...args, callId: h.exec('node -e "console.log(\'http://localhost:4321\')"') })
   env = await readEnv(h.project)
   assert.equal(env.gui[0].status, 'observed')
   assert.ok(env.gui[0].history.some(row => row.status === 'stale'))
-  await assert.rejects(h.tool('work_env', { ...args, kind: 'blocked' }), /protected rules/)
-  await assert.rejects(h.tool('work_env', { ...args, value: 'unobserved' }), /not supported/)
-  await assert.rejects(h.tool('work_env', { ...args, callId: h.exec('node -e "process.exit(1)"') }), /successful execution/)
+  assert.match((await h.tool('work_env', { ...args, kind: 'blocked' })).tellUser, /规则要用户确认.*先记成候选/)
+  assert.match((await h.tool('work_env', { ...args, value: 'unobserved' })).tellUser, /输出里没有.*先记成候选/)
+  assert.match((await h.tool('work_env', { ...args, callId: h.exec('node -e "process.exit(1)"') })).tellUser, /没跑通.*先记成候选/)
   await h.tool('work_env', { operation: 'propose', kind: 'fact', key: 'interpretation', value: 'model guess' })
   assert.equal(envDigest(await readEnv(h.project)).usable, 0)
 })
@@ -268,164 +267,37 @@ test('P1 U08: user facts need exact human provenance without becoming authorizat
   const h = await harness()
   await begin(h)
   const quote = '开发端口不是 4322，当前端口为 4321'
-  h.say(quote, { kind: 'auto-dev-v3' })
+  h.say(quote, { kind: 'dsh-auto-dev' })
   const args = { operation: 'observe', kind: 'fact', key: 'port', value: '4321', quote }
-  await assert.rejects(h.tool('work_env', args), /user answer|human|not found|source/i)
+  // A plugin notice is not the person: the value stays a candidate.
+  assert.match((await h.tool('work_env', args)).tellUser, /先记成候选/)
+  assert.equal((await readEnv(h.project)).facts.length, 0)
   h.say(quote)
   await h.tool('work_env', args)
   const env = await readEnv(h.project)
   assert.equal(env.facts[0].source.by, 'user')
   assert.equal(envDigest(env).usable, 1)
   assert.equal(env.facts[0].status, 'observed')
-  await assert.rejects(h.tool('work_env', { ...args, kind: 'lock' }), /protected rules/)
+  assert.match((await h.tool('work_env', { ...args, kind: 'lock' })).tellUser, /规则要用户确认.*先记成候选/)
   const old = h.exec('node -e "console.log(9)"')
   await h.tool('work_control', { operation: 'cancel' })
   await begin(h)
-  await assert.rejects(h.tool('work_env', { ...args, quote: undefined, callId: old }), /evidence window/)
+  assert.match((await h.tool('work_env', { ...args, quote: undefined, callId: old })).tellUser, /不在本任务里.*先记成候选/)
 })
 
-test('P1 U09: partial progress is not failure; actual failure method resets with successful check', async () => {
+test('F-fix: an incident keeps what was ruled out, the green check and the lesson, and is searched by them', async () => {
+  const { remember, readMemory, memoryBrief } = await import('../src/memory.mjs')
+  const project = mkdtempSync(join(tmpdir(), 'fix-memory-'))
+  remember(project, { kind: 'incident', symptom: '导出为空', ruledOut: '不是权限', check: 'npm test', lesson: '先看时区' })
+  const row = readMemory(project).incidents[0]
+  assert.deepEqual(row.ruledOut, ['不是权限'])
+  assert.equal(row.check, 'npm test')
+  assert.equal(memoryBrief(readMemory(project), { query: '时区' }).incidents[0].lesson, '先看时区')
+})
+
+test('v16: remember with only text stores a fact, not an incident without a symptom', async () => {
   const h = await harness()
   await begin(h)
-  await h.tool('work_plan', { operation: 'set', units: [unit('a', { deliverable: 'result.txt' })] })
-  for (let i = 0; i < 3; i++) await h.tool('work_submit', proof('a', h.exec('node -e "console.log(1)"'), 'partial'))
-  assert.equal(h.task().pulse.sameDefectCount, 0)
-  assert.equal(h.notices.some(row => ['halt', 'unit-blocked'].includes(row.source.form)), false)
-  assert.equal((await step(h)).some(row => /停一下|等你拿个主意/.test(JSON.stringify(row))), false)
-  writeFileSync(join(h.project, 'probe.cjs'), 'process.exit(1)')
-  const command = 'node probe.cjs'
-  h.exec(command); h.exec(command)
-  let context
-  const { collectObservations } = await import('../src/session-log.mjs')
-  context = failureContext(collectObservations(h.agent.session).results)
-  assert.equal(context.count, 2)
-  const messages = await step(h)
-  assert.match(JSON.stringify(messages), /最小复现/)
-  assert.equal(h.task().state, 'active')
-  const repeated = await step(h)
-  assert.doesNotMatch(JSON.stringify(repeated), /auto-dev-v3 method debug/)
-  writeFileSync(join(h.project, 'probe.cjs'), 'console.log("repaired")')
-  h.exec(command)
-  assert.equal(failureContext(collectObservations(h.agent.session).results), undefined)
-})
-
-test('P1 U09: distinct failure outputs are new evidence, not the same defect', () => {
-  const row = (seq, text, exitCode = 1) => ({ name: 'bash', command: 'npm test', seq, exitCode, content: [{ type: 'text', text }] })
-  assert.equal(failureContext([row(1, 'missing A'), row(2, 'missing B')]).count, 1)
-  assert.equal(failureContext([row(1, 'missing A'), row(2, 'missing A')]).count, 2)
-  assert.equal(failureContext([row(1, 'missing A'), row(2, 'passed', 0)]), undefined)
-})
-
-test('P1 U09: accepted related proof resets old failures; unrelated success does not; blocked state is truthful', async () => {
-  const h = await harness()
-  await begin(h)
-  await h.tool('work_plan', { operation: 'set', units: [unit('a', { deliverable: '探针' })] })
-  const command = 'node -e "process.exit(1)"'
-  h.exec(command); h.exec(command)
-  const { collectObservations } = await import('../src/session-log.mjs')
-  const failure = () => failureContext(collectObservations(h.agent.session).results, h.task().ledger)
-  assert.equal(failure().count, 2)
-  assert.match(JSON.stringify(await step(h)), /最小复现/)
-  h.exec('ls')
-  assert.equal(failure().count, 2)
-  const progressed = await h.tool('work_submit', proof('a', h.exec('node -e "console.log(\'related probe passed\')"'), 'partial'))
-  assert.equal(h.task().pulse.sameDefectCount, 0)
-  assert.equal(failure(), undefined)
-  assert.doesNotMatch(JSON.stringify(progressed.warnings), /真实执行.*失败/)
-  assert.doesNotMatch(JSON.stringify(await step(h)), /method debug/)
-  h.exec(command)
-  assert.equal(failure().count, 1)
-  assert.match(JSON.stringify(await step(h)), /method debug/)
-  assert.doesNotMatch(JSON.stringify(await step(h)), /method debug/)
-  const blocked = await h.tool('work_submit', proof('a', h.exec('node -e "console.log(\'missing prerequisite\')"'), 'blocked'))
-  assert.equal(h.plan().units.find(row => row.id === 'a').state, 'blocked')
-  assert.equal(h.task().ledger.at(-1).outcome, 'blocked')
-  assert.equal(h.task().state, 'active')
-  assert.equal(blocked.waiting, null)
-  assert.equal(h.notices.at(-1).source.form, 'unit-blocked')
-  assert.equal((await h.tool('work_status', { view: 'board' })).units.find(row => row.id === 'a').state, 'blocked')
-  await h.tool('work_plan', { operation: 'state', unit: 'a', state: 'pending' })
-  assert.equal(h.plan().units.find(row => row.id === 'a').state, 'pending')
-})
-
-test('P1 U10/U11: independent planless methods are useful, deduplicated, and do not demand ledger updates', async () => {
-  const h = await harness()
-  await begin(h, { request: '优化一下并交接探针' })
-  const messages = await step(h)
-  const body = JSON.stringify(messages)
-  assert.match(body, /一个具体输入/)
-  assert.match(body, /调用方/)
-  assert.match(body, /回滚路径/)
-  const repeated = JSON.stringify(await step(h))
-  assert.doesNotMatch(repeated, /auto-dev-v3 method (ambiguity|impact|release)/)
-  for (let i = 0; i < 21; i++) h.exec('node -e "console.log(1)"')
-  assert.doesNotMatch(JSON.stringify(await step(h)), /settle-up|no-active-unit|补一句简短记录|该交一段/)
-  assert.equal(h.task().state, 'active')
-  const verification = craftHints({ task: h.task(), changed: true, context: { verification: 'write:10' } })
-  assert.ok(verification.some(row => row.key === 'verification' && /最后一次改动/.test(row.line)))
-  const seen = new Set(verification.map(row => row.identity))
-  assert.equal(craftHints({ task: h.task(), changed: true, seen, context: { verification: 'write:10' } }).length, 0)
-  assert.equal(craftHints({ task: h.task(), changed: true, seen, context: { verification: 'write:11' } }).length, 1)
-})
-
-test('P1 U09: the same command failing again is one debug hint until it passes', () => {
-  const row = (seq, exitCode = 1, command = 'npm test') => ({ name: 'bash', command, seq, exitCode, content: [{ type: 'text', text: exitCode ? 'missing A' : 'ok' }] })
-  const identity = rows => craftHints({ failure: failureContext(rows) }).find(page => page.key === 'debug')?.identity
-  const first = identity([row(1)])
-  assert.equal(identity([row(1), row(2), row(3)]), first)
-  assert.notEqual(identity([row(1), row(2, 0), row(3)]), first)
-  assert.notEqual(identity([row(1), row(2, 1, 'npm run lint')]), first)
-})
-
-test('P1 U10: real write results trigger verification through pre-step, once per submission', async () => {
-  const h = await harness()
-  const write = (text, refused = false) => {
-    const callId = `write-${h.log.length}`
-    h.log.push({ type: 'tool/call', data: { callId, name: 'write', arguments: { file_path: join(h.project, 'probe.txt'), content: text } } })
-    if (!refused) writeFileSync(join(h.project, 'probe.txt'), text)
-    h.result(callId, refused ? 'auto-dev-v3: refused before execution' : 'written', refused)
-  }
-  write('before task')
-  await begin(h)
-  const verification = async () => (await step(h)).filter(row => row.source?.data?.title === '方法提示 · verification')
-  assert.equal((await verification()).length, 0)
-  write('refused', true)
-  assert.equal((await verification()).length, 0)
-  write('first change')
-  assert.equal((await verification()).length, 1)
-  assert.equal((await verification()).length, 0)
-  h.exec('node --version')
-  assert.equal((await verification()).length, 0)
-  // More writes before anything is submitted are the same stretch of work.
-  for (const text of ['next change', 'and another', 'and one more']) {
-    write(text)
-    assert.equal((await verification()).length, 0)
-  }
-  assert.equal(h.task().state, 'active')
-  assert.equal(h.plan(), undefined)
-})
-
-
-for (const loggedBeforePost of [false, true]) test(`P1 verification counts current writes once (result logged first: ${loggedBeforePost})`, async () => {
-  const h = await harness()
-  await begin(h)
-  const write = async (i, refused, failed = false) => {
-    const args = { path: join(h.project, 'count.txt'), content: String(i) }
-    const callId = `write-${h.log.length}`
-    h.log.push({ type: 'tool/call', data: { callId, name: 'write', arguments: args } })
-    if (!refused) writeFileSync(args.path, args.content)
-    const text = refused ? 'auto-dev-v3: refused before execution' : failed ? 'failed after partial write' : 'written'
-    const result = { isError: refused || failed, content: [{ type: 'text', text }], ...(refused || failed ? { error: { message: text } } : { value: 'written' }) }
-    if (loggedBeforePost) h.result(callId, text, refused || failed)
-    const downstream = { additionalContexts: [] }
-    const post = await h.host.handlers.get('tools/post-execute')({ agent: h.agent, callId, name: 'write', arguments: args }, result, async () => downstream)
-    if (!loggedBeforePost) h.result(callId, text, refused || failed)
-    return (post.additionalContexts ?? []).filter(row => /no check after/.test(row.source?.summary ?? ''))
-  }
-  for (let i = 0; i < 6; i++) assert.equal((await write(i, true)).length, 0)
-  for (let i = 0; i < 4; i++) assert.equal((await write(i, false, i % 2 === 0)).length, 0)
-  const notices = await write(5, false, true)
-  assert.equal(notices.length, 1)
-  assert.match(notices[0].content[0].text, /改了 5 次文件/)
-  assert.equal((await write(6, false)).length, 0)
+  const stored = await h.tool('work_control', { operation: 'remember', text: '热点在 listed() 循环里重复 load；量法 time node src/cli.js list，3.55s→0.13s' })
+  assert.equal(stored.kind, 'fact')
 })

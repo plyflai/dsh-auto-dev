@@ -16,7 +16,7 @@ description: Practical methods for Auto Dev delivery, debugging, impact analysis
 | 有阶段结果 | `work_submit` | 证据关联、进度、下一步或真实等待 |
 | 读状态或找执行证据 | `work_status` | summary / executions / board / tasks |
 | 控制、普通记录、接手或交接 | `work_control` | 状态、记录或快照；见 [低频操作](references/operations.md) |
-| 需要具体动作的人工决定 | `work_extend` | 有来源的决定；不得代替用户同意 |
+| 缺能力或要放宽检查 | `work_extend` | 告诉你该问用户什么；不可逆操作不用它：插件先拦一次，你问用户，他的回话决定 |
 | 观察或更新运行环境 | `work_env` | `.auto-dev/runtime.json` 的事实、候选与规则 |
 
 ## 按当前问题读

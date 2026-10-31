@@ -6,6 +6,7 @@
  * stored here — it is resolved from the session log on demand, so a record can
  * never claim an execution that did not happen.
  */
+import { invariant } from './gate.mjs'
 export const TABLES = ['tasks', 'plans', 'decisions', 'sessions']
 
 // Write order inside this process, stamped on the stored row itself. `updatedAt`
@@ -18,7 +19,7 @@ let writes = 0
 export class Records {
   static async open(backend) {
     const unit = await backend.kv.open({
-      name: 'auto_dev_v3', version: 1, tables: TABLES,
+      name: 'dsh_auto_dev', version: 1, tables: TABLES,
       hasGlobal: false, layout: 'per-record',
     })
     try {
@@ -27,9 +28,7 @@ export class Records {
         // A backend that has never written a table may omit it entirely; an
         // absent table is empty, not malformed.
         for (const [id, row] of Object.entries(snapshot.tables?.[table] ?? {})) {
-          if (row?.version !== 1 || row.id !== id || typeof row.project !== 'string') {
-            throw new Error(`auto-dev-v3: malformed ${table}/${id}`)
-          }
+          invariant(row?.version === 1 && row.id === id && typeof row.project === 'string', `malformed ${table}/${id}`)
         }
       }
       return new Records(unit, snapshot.tables)
@@ -69,7 +68,7 @@ export class Records {
       const before = this.get(table, id)
       const after = update(before)
       if (after === undefined) return before
-      if (after.id !== id || after.version !== 1) throw new Error('auto-dev-v3: invalid record identity/version')
+      invariant(after.id === id && after.version === 1, 'invalid record identity/version')
       await this.unit.putRecord(table, id, after)
       const row = structuredClone(after)
       writeOrder.set(row, ++writes)

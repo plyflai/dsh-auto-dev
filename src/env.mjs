@@ -16,6 +16,7 @@
  */
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { commandsOf } from './risk.mjs'
 
 export const ENV_FILE = '.auto-dev/runtime.json'
 export const MAX_FACTS = 40
@@ -94,4 +95,42 @@ export function envLine(digest) {
   const head = [...digest.lines, ...(digest.gui ?? [])].slice(0, 3).join('；')
   const tail = digest.confirmed > 3 ? `（还有 ${digest.confirmed - 3} 条，读 ${ENV_FILE}）` : ''
   return `这个项目记过：${head}${tail}`
+}
+
+/**
+ * The fragments of a blocked row worth matching against a path: its key, and
+ * path-like words in its value. "不许改 migrations/ 下的历史文件" → ["migrations"].
+ */
+export function needlesOf(row) {
+  const words = String(row?.value ?? '').split(/[\s，。、；;:：()（）"'“”]+/)
+  return [row?.key, ...words]
+    .map(word => String(word ?? '').trim().toLowerCase().replace(/\/+$/, ''))
+    .filter(word => word.length >= 2 && (word.includes('/') || /^[a-z0-9._-]+$/.test(word)))
+}
+
+/** The first live blocked row one of `paths` falls under (G3), or undefined. Paths only, never command text. */
+export function blockedBy(env, paths = []) {
+  const lower = paths.map(path => String(path).toLowerCase())
+  for (const row of env?.blocked ?? []) {
+    if (row.status === 'stale') continue
+    const path = lower.find(path => needlesOf(row).some(needle => path.split('/').includes(needle) || path.includes(`${needle}/`) || path.endsWith(needle)))
+    if (path) return { row, path: paths[lower.indexOf(path)] }
+  }
+  return undefined
+}
+
+/**
+ * The first live blocked row whose value is a command the person wrote, run as
+ * one of the simple commands on this line: its words, in order, at the start.
+ * "psql prod" blocks `psql prod -c …`, never `echo psql prod`.
+ */
+export function blockedCommand(env, command) {
+  const runs = commandsOf(command ?? '')
+  for (const row of env?.blocked ?? []) {
+    if (row.status === 'stale') continue
+    const words = String(row.value ?? '').trim().split(/\s+/).filter(Boolean)
+    if (!words.length || !/^[\w.-]+$/.test(words[0])) continue
+    if (runs.some(run => words.every((word, index) => run[index] === word))) return { row, command }
+  }
+  return undefined
 }

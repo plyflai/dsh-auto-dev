@@ -199,7 +199,7 @@ test('the step after a lost call is told before the turn ends', async () => {
     async () => ({ kind: 'continue', messages: [] }),
   )
   assert.equal(decision.messages.length, 1)
-  assert.equal(decision.messages[0].source.summary, 'auto-dev-v3 伪调用纠正')
+  assert.equal(decision.messages[0].source.summary, 'dsh-auto-dev 伪调用纠正')
   assert.match(decision.messages[0].content[0].text, /await tools\.read\(/)
   assert.match(decision.messages[0].content[0].text, /README\.md/)
 })
@@ -242,7 +242,7 @@ function rescueHost(optedIn = () => true) {
       id: 'notice-1',
       role: 'user',
       content: [{ type: 'text', text: body }],
-      source: { kind: 'auto-dev-v3', form: extra.form ?? 'notice', summary },
+      source: { kind: 'dsh-auto-dev', form: extra.form ?? 'notice', summary },
     }),
     optedIn,
     sessionId: () => 'session-1',

@@ -64,7 +64,6 @@ async function harness({ project = mkdtempSync(join(tmpdir(), 'dsh-p2-')), table
 }
 
 
-import { failureContext, craftHints } from '../src/craft.mjs'
 
 const proof = (id, callId, outcome = 'complete') => ({ ...(id ? { unit: id } : {}), outcome,
   summary: '探针已执行', next: '继续已授权工作', claims: [{ statement: '探针可执行', execution: { callId } }] })

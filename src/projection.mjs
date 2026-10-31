@@ -15,10 +15,10 @@
 import { taskStatus, planProgress } from './status.mjs'
 import { modeLabel } from './mode.mjs'
 import { resultFailed } from './session-log.mjs'
+import { invariant } from './gate.mjs'
 
-// A command that reads as a check: the project's own verifier, or a test/type/lint run.
-const CHECK_WORDS = /\b(?:test|tests|check|lint|tsc|vitest|jest|pytest|playwright|mocha)\b/
-const isCheck = (command, verifier) => (typeof verifier === 'string' && verifier !== '' && command.includes(verifier)) || CHECK_WORDS.test(command)
+// The project's own check, run plainly: the same exact match the hooks use (src/facts.mjs).
+const isCheck = (command, verifier) => typeof verifier === 'string' && verifier !== '' && command.trim() === verifier.trim()
 
 /** A tool call that handed work to another agent: its writes are not in this log. */
 const DELEGATION = /^(subagent|spawn_agent|workflow)(?:_|$)/
@@ -792,7 +792,7 @@ export function boardOf(state, live) {
     unverified: current.unverified ?? [],
     hasReceipt: Boolean(current.hasReceipt),
     clarify: current.clarify ?? null,
-    counting: total > 0 ? { done, total, label: `${done}/${total}` } : { done: 0, total: 0, label: current.submits > 0 ? '已交付' : '未开始' },
+    counting: total > 0 ? { done, total, label: `${done}/${total}` } : { done: 0, total: 0, label: current.submits > 0 || ['review_ready', 'closed'].includes(current.taskState) ? '已交付' : '未开始' },
     units: current.units.map(unit => ({
       id: unit.id, goal: unit.goal, state: unit.state,
       // The newest progress line, verbatim, plus the trail the expander opens.
@@ -853,7 +853,7 @@ export function boardOf(state, live) {
 export const boardSchema = {
   parse(value) {
     if (value === null || value === undefined) return null
-    if (typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid Auto Dev v3 board')
+    invariant(typeof value === 'object' && !Array.isArray(value), 'invalid Auto Dev v3 board')
     return value
   },
 }
@@ -1049,7 +1049,7 @@ export function registerBoard(ctx, options = {}) {
     return boardOf(seeded, live ?? [])
   }
   const disposer = ctx.sessionProjections.register({
-    key: 'autoDevV3',
+    key: 'dshAutoDev',
     stateSchema: boardSchema,
     init: header => syncState({ ...EMPTY, sessionId: header?.id ?? null }, store),
     apply: (state, event) => syncState(foldBoard(state, event), store),

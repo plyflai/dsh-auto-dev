@@ -40,11 +40,11 @@ Vibe coding makes fast fashion: use it once, throw it away. dsh-auto-dev ships p
 
 ### 7. Requirement clarification: it asks before it guesses
 - **Vibe coding:** starts on a one-liner, builds the wrong thing.
-- **dsh-auto-dev:** asks two or three questions on business-critical points; decides technical details itself.
+- **dsh-auto-dev:** when a request has several parts or anything vague, it restates what it understood before touching code, explains any cheaper alternative, and asks the one question that matters most; it decides technical details itself.
 
 ### 8. Rolling Git checkpoints: save before every boss fight
 - **Vibe coding:** one slip and your code is gone.
-- **dsh-auto-dev:** saves before big changes and after tests pass; roll back anytime. Deleting data or deploying always asks you first.
+- **dsh-auto-dev:** saves before a fix and after it passes; roll back anytime. Hard resets, force-pushes, publishing and deploys always ask you first.
 
 ## Install
 
@@ -102,17 +102,31 @@ Kept in your project's `.auto-dev/` as plain files you can read and edit:
 
 | File | What it holds |
 | --- | --- |
-| `memory.json` | Pitfalls: root causes and fixes |
-| `runtime.json` | Environment: observed facts, with source and expiry |
-| `project-domain.md` | Business rules: terms and decisions you made |
+| `incidents.md` | Postmortems: symptom, directions tried, root cause, fix, how it was verified (required after a fix; at most 30 entries) |
+| `project-domain.md` | Business rules: terms and the rulings you made |
+| `memory.json` · `runtime.json` | Pitfalls and observed environment facts (with source and expiry) |
 
-Commit them to share with your team, or add `.auto-dev/` to `.gitignore`. Task progress lives in DSH's own storage.
+Their text goes to the model at every start. Commit them to share with your team, or add `.auto-dev/` to `.gitignore`. Task progress lives in DSH's own storage.
+
+Experience across projects lives in `~/.dsh-auto-dev/`:
+
+| Path | What it holds |
+| --- | --- |
+| `incidents/<project>.md` | A copy of each project's postmortems at hand-in; another project's start carries the newest entry of the 3 most recent projects (at most 20 projects kept) |
+| `conventions.md` | Team conventions you write yourself (naming, style…), carried verbatim at every start; the project's own conventions win on conflict |
+
+`DSH_AUTO_DEV_HOME` moves this location.
 
 ## Checkpoints and rollback
 
-- Checkpoints are Git-based (under `refs/dsh-auto-dev/`) and never move your HEAD, branch or index. Background checkpoints keep the latest 5; the ones around milestones are kept.
+- Checkpoints are Git-based (under `refs/dsh-auto-dev/`) and never move your HEAD, branch or index. Each task keeps its latest 5; the repository keeps the saves of the latest 3 tasks, the rest is left to `git gc`.
 - Rollback restores Git-tracked files only, and every rollback needs your explicit OK. Untracked files, databases and running services are not covered.
-- Recursive deletes, history rewrites, deploys and destructive SQL run only with your OK for that task and that action.
+- Only four gates ever stop the model; everything else is a reminder:
+  - **Honest delivery**: no passing project check after the last change — the plugin runs it itself and refuses only if it is red;
+  - **Destructive commands**: `git reset --hard`, `git clean -f`, force-push, `branch -D`, `stash drop`, any `publish`, terraform / kubectl / helm, `vercel --prod`, `fly deploy`, `gh release create` run only with your OK this time;
+  - **Your bans**: a place you said not to touch is refused;
+  - **Postmortem on disk**: a bug was fixed but `incidents.md` did not change — the hand-in is refused once.
+- Commands outside that list, such as `rm -rf` or SQL, are not stopped; checkpoints and the "deleted · still referenced" card are the safety net.
 
 ## For developers
 
@@ -120,12 +134,12 @@ In chats that opted in, the model gets seven tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `work_start` | Register your request verbatim, with scope and acceptance criteria |
+| `work_start` | Register a task (already done for you when you start with the command; every argument is optional) |
 | `work_plan` | Optional units, dependencies and grouping |
 | `work_submit` | Hand in a result tied to real executions from this session |
 | `work_status` | Read the task, its executions and the board |
 | `work_control` | Pause, accept, rework, hand off, checkpoints, notes |
-| `work_extend` | Record a decision you made, bound to one task and one action |
+| `work_extend` | For things that need your OK: tells the model what to ask you (it never grants anything itself) |
 | `work_env` | Facts about the environment, with their source |
 
 The engineering playbook lives in [skills/auto-dev](skills/auto-dev/SKILL.md).

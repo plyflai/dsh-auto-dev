@@ -271,7 +271,7 @@ test('an irreversible call is refused before it runs, not reported after', async
   await workStart.execute({ request: 'refactor the slug module', mode: 'do', scope: ['.'] }, exec)
   const denied = await pre({ name: 'bash', arguments: { command: 'git reset --hard' }, agent, callId: 'c1' }, next)
   assert.equal(denied.kind, 'deny')
-  assert.match(denied.reason, /破坏性操作.*\n过关：先问用户/s)
+  assert.match(denied.reason, /破坏性操作.*\n过关：用问题卡问用户，只给两个选项「同意，照做」「不同意，换做法」/s)
   assert.doesNotMatch(denied.reason, /work_extend|forced-git-reset/)
 
   // A check the task is allowed to run is not refused.
@@ -612,8 +612,12 @@ test('an option the owner picked lets the stopped action through; nothing is cop
   const action = { name: 'bash', arguments: { command: 'git push --force' }, agent }
   assert.equal((await pre({ ...action, callId: 'c1' }, next)).kind, 'deny')
   log.push({ type: 'tool/call', data: { callId: 'q1', name: 'ask_user_question', arguments: { questions: [{ question: 'Allow git push --force?' }] } } })
+  // Only the gate's own option counts: a label the plugin did not offer is not a yes.
   log.push({ type: 'tool/result', data: { message: { toolCallId: 'q1', isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'ask', selected: ['allow'] }] }) }] } } })
-  assert.equal((await pre({ ...action, callId: 'c2' }, next)).kind, 'continue')
+  assert.equal((await pre({ ...action, callId: 'c2' }, next)).kind, 'deny')
+  log.push({ type: 'tool/call', data: { callId: 'q2', name: 'ask_user_question', arguments: { questions: [{ question: 'Allow git push --force?' }] } } })
+  log.push({ type: 'tool/result', data: { message: { toolCallId: 'q2', isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'ask', selected: ['同意，照做'] }] }) }] } } })
+  assert.equal((await pre({ ...action, callId: 'c3' }, next)).kind, 'continue')
 })
 
 test('a build plan arrives compiled: units in order, one verifier read from the repository', async () => {
@@ -639,7 +643,7 @@ test('a build plan arrives compiled: units in order, one verifier read from the 
   assert.deepEqual(listed.runnable, ['u1'])
 })
 
-test('a task can name its own project root, and a root that does not exist is refused', async () => {
+test('a task can name its own project root; a root that does not exist is dropped, not refused (大原则 2)', async () => {
   const sessionRoot = mkdtempSync(join(tmpdir(), 'v3-session-'))
   const real = mkdtempSync(join(tmpdir(), 'v3-elsewhere-'))
   writeFileSync(join(real, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }))
@@ -651,7 +655,8 @@ test('a task can name its own project root, and a root that does not exist is re
   const named = await start({ request: 'x', mode: 'do', scope: ['.'], project: real })
   assert.equal(named.project, real, 'an explicit root beats every inference')
 
-  await assert.rejects(() => start({ request: 'x', mode: 'do', scope: ['.'], project: join(real, 'nope') }), /is not a directory/)
+  const dropped = await start({ request: 'x', mode: 'do', scope: ['.'], project: join(real, 'nope') })
+  assert.equal(dropped.project, sessionRoot, 'a root that is not a directory falls back to the session folder')
 })
 
 test('a nested plan compiles to its leaves, and the report counts them rather than the milestones', async () => {
@@ -886,8 +891,10 @@ test('a slash command cannot address the model, so it leaves a request the next 
   const notice = step.messages.find(message => message.source?.kind === 'dsh-auto-dev')
   assert.ok(notice, 'the request has to reach the model somehow')
   assert.match(notice.content[0].text, /给 slug 加 trim，并补一个测试/)
-  assert.match(notice.content[0].text, /已经登记好，直接开工/)
-  assert.equal(Object.values(stub.tables.tasks).find(task => task.sessionId === 'sess-e')?.request, '给 slug 加 trim，并补一个测试')
+  // Nothing is registered at the start: the request is made clear first (F-clarify 6b).
+  assert.match(notice.content[0].text, /先弄清要什么再动手/)
+  assert.doesNotMatch(notice.content[0].text, /work_start|直接开工/)
+  assert.equal(Object.values(stub.tables.tasks ?? {}).find(task => task.sessionId === 'sess-e'), undefined)
 
   // Delivered once: the next step must not repeat it as if it were fresh.
   const again = await pre({ agent, messages: [], step: 2 }, next)
@@ -980,7 +987,9 @@ test('adopt continues in the same gesture, and the turn names the task and the f
   const adopted = await stub.commands[0].handler({ agent, rawInput: 'adopt' })
   assert.equal(adopted.kind, 'success')
   assert.equal(turns.length, 1, 'adopting without continuing would need a second message')
-  assert.match(turns[0].content[0].text, new RegExp(started.taskId))
+  // The visible turn names the task by its words, never its id (v55 handoff).
+  assert.doesNotMatch(turns[0].content[0].text, new RegExp(started.taskId))
+  assert.match(turns[0].content[0].text, /继续「/)
   assert.match(turns[0].content[0].text, /接手卡/)
   assert.equal(turns[0].source.kind, 'user')
 })
@@ -1093,16 +1102,23 @@ test('work_start is not even offered until the user starts, and one start grants
   const hinted = await preStep({ agent, messages: [turns[0]], step: 1 }, async () => ({ kind: 'continue', messages: [turns[0]] }))
   const granted = hinted.messages.find(message => message.source?.summary === 'dsh-auto-dev start granted')
   assert.ok(granted)
-  // The start registered the task itself: the model reads the user's words and begins, filling nothing.
+  // The start asks for the request to be made clear; nothing is registered yet, and no tool is named.
   assert.doesNotMatch(granted.content[0].text, /work_start/)
-  assert.match(granted.content[0].text, /不用再问要不要开始/)
+  assert.match(granted.content[0].text, /先弄清要什么再动手/)
   assert.match(granted.content[0].text, /把登录按钮改成进度条/)
   assert.equal(hinted.messages.some(message => message.source?.summary === 'dsh-auto-dev standing hint'), false)
   const repeated = await preStep({ agent, messages: [turns[0]], step: 1 }, async () => ({ kind: 'continue', messages: [turns[0]] }))
-  assert.equal(repeated.messages.some(message => message.source?.summary === 'dsh-auto-dev start granted'), false, 'the registration is once per grant')
-  assert.equal(Object.keys(stub.tables.tasks).length, 1)
+  assert.equal(repeated.messages.some(message => message.source?.summary === 'dsh-auto-dev start granted'), false, 'the card is once per grant')
+  assert.equal(Object.keys(stub.tables.tasks ?? {}).length, 0)
+  // The person answers the restatement; the model then registers its own wording.
+  log.push({ type: 'user/message', data: { message: { source: { kind: 'user' }, content: [{ type: 'text', text: '只改首页那个按钮' }] } } })
+  const opened = await call('work_start', { request: '首页登录按钮：点击后显示进度条直到登录返回', mode: 'do', project })
+  assert.ok(opened.taskId)
   const seen = await call('work_status', {})
   assert.equal(seen.task.request, '把登录按钮改成进度条')
+  const record = stub.tables.tasks[opened.taskId]
+  assert.equal(record.goal, '首页登录按钮：点击后显示进度条直到登录返回')
+  assert.deepEqual(record.replies.map(reply => reply.text), ['只改首页那个按钮'])
 
   // One start, one task: a second call hears the task already open (v32 #53 said "nobody started"),
   // and books nothing new.
@@ -1321,7 +1337,9 @@ test('new opens a fresh task even while older work is unfinished', async () => {
   // are the grant, so a fresh task can be registered while the older one waits.
   const tools = Object.fromEntries(stub.tools.map(tool => [tool.name, tool]))
   assert.ok(tools.work_start, 'the command is the opt-in: the tools arrive with it')
-  // The command's words registered the new task on the first step; the model filled nothing.
+  // Registered once the model has made the request clear; the person's words stay the request.
+  assert.equal(Object.values(stub.tables.tasks).find(task => task.sessionId === 'session-new'), undefined)
+  await tools.work_start.execute({ request: '另起一件事：……', project }, { agent, callId: 'n1' })
   const started = Object.values(stub.tables.tasks).find(task => task.sessionId === 'session-new')
   assert.equal(started.request, '另起一件事')
   assert.notEqual(started.id, 'task-old')
@@ -1855,7 +1873,7 @@ test('目标改一次多一版，旧的一句不丢', async () => {
   assert.deepEqual(board.task.goalHistory, ['导出三种格式都能打开'])
 })
 
-test('有可看的东西就先停下等人：说「可以」收案，说哪里不对就退回改', async () => {
+test('有可看的东西就先停下等人：人的回话原样交给模型，同意还是退回由模型判断', async () => {
   const stub = stubContext('/tmp/v3-review')
   await testApply(stub, { checkpoints: false })
   const tool = name => stub.tools.find(entry => entry.name === name)
@@ -1895,7 +1913,7 @@ test('有可看的东西就先停下等人：说「可以」收案，说哪里�
   // 人的话只是决定；改状态是模型那一步的事（work_control），宿主不再替它猜。
   human(log, '列少了，缺更新时间')
   const revise = await pre({ agent, messages: [{ role: 'user', content: [{ type: 'text', text: '列少了，缺更新时间' }], source: { kind: 'user' } }], step: 3 }, next)
-  assert.match(revise.messages.at(-1).content[0].text, /退回（rework）按他说的改/)
+  assert.match(revise.messages.at(-1).content[0].text, /用户在验收时回了：「列少了，缺更新时间」。如果这是同意，收案（accept）.*如果提了意见，退回（rework）按他说的改/)
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'review_ready')
   await run('work_control', { operation: 'rework', text: '列少了，缺更新时间' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'active')
@@ -1907,7 +1925,7 @@ test('有可看的东西就先停下等人：说「可以」收案，说哪里�
   await run('work_submit', { unit: 'a', outcome: 'complete', summary: '补上更新时间', next: '收', claims: [{ statement: 'node --version', execution: { callId: 'sh-2' } }] })
   human(log, '可以，就这样')
   const accepted = await pre({ agent, messages: [{ role: 'user', content: [{ type: 'text', text: '可以，就这样' }], source: { kind: 'user' } }], step: 4 }, next)
-  assert.match(accepted.messages.at(-1).content[0].text, /这算同意，收案/)
+  assert.match(accepted.messages.at(-1).content[0].text, /用户在验收时回了：「可以，就这样」。如果这是同意/)
   await run('work_control', { operation: 'accept', text: '可以，就这样' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'closed')
   // 收案那一刻的回执由工具排队，下一次工具调用结束时交给宿主——这里把它抽出来看。
@@ -1967,7 +1985,7 @@ test('连续 partial 不会误判为失败或要求停下', async () => {
   assert.equal(again.messages.some(row => row.source?.form === 'halt'), false)
 })
 
-test('人用一句话答应也收案，且未知 operation 不会写坏记录', async () => {
+test('人用一句话答应：回话原样交给模型；未知 operation 不会写坏记录', async () => {
   const stub = stubContext('/tmp/v3-review-natural')
   await testApply(stub, { checkpoints: false })
   const tool = name => stub.tools.find(entry => entry.name === name)
@@ -2000,7 +2018,7 @@ test('人用一句话答应也收案，且未知 operation 不会写坏记录', 
     messages: [{ role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '我点开看过了，可以' }] }],
     step: 3,
   }, async () => ({ kind: 'continue', messages: [] }))
-  assert.match(answered.messages.at(-1).content[0].text, /这算同意，收案/)
+  assert.match(answered.messages.at(-1).content[0].text, /用户在验收时回了：「我点开看过了，可以」。如果这是同意/)
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'review_ready', '一句话只是证据，状态由工具改')
   await run('work_control', { operation: 'accept', text: '我点开看过了，可以' })
   assert.equal(stub.records.get(`tasks/${started.taskId}`).state, 'closed')
@@ -2088,15 +2106,15 @@ test('first-write card: the start words cut into sentences, verbatim, only when 
   const { firstWriteCard, requestSentences } = await import('../src/craft.mjs')
   const request = '/dsh-auto-dev notes 想加几个东西：list 能按关键词过滤；另外 rm 删不存在的 id 会说 removed，这个不对；顺便 add 空文本应该拒绝；还有 usage 也更新一下。验收：npm test 全过。'
   assert.deepEqual(requestSentences(request), ['notes 想加几个东西：list 能按关键词过滤', '另外 rm 删不存在的 id 会说 removed，这个不对', '顺便 add 空文本应该拒绝', '还有 usage 也更新一下'])
-  assert.match(firstWriteCard(false, undefined, request)[0], /事实：开工原话断开是 4 句，开工后用户还没说过话——「notes 想加几个东西：list 能按关键词过滤」「另外 rm/)
-  assert.doesNotMatch(firstWriteCard(true, undefined, request)[0], /开工原话/, '用户说过话就不再提')
-  assert.doesNotMatch(firstWriteCard(false, undefined, '修一下 add 的重复 id，顺便补个测试')[0], /开工原话/, '一两句不说')
+  assert.match(firstWriteCard(true, undefined, request)[0], /事实：开工原话断开是 4 句，开工后用户还没说过话——「notes 想加几个东西：list 能按关键词过滤」「另外 rm/)
+  assert.doesNotMatch(firstWriteCard(false, undefined, request)[0], /开工原话/, '登记过或用户说过话就不再提')
+  assert.doesNotMatch(firstWriteCard(true, undefined, '修一下 add 的重复 id，顺便补个测试')[0], /开工原话/, '一两句不说')
 })
 
-test('first-write card: 先复述 only while the person has not spoken since the start', async () => {
+test('first-write card: 先复述 only when the plugin registered at this write and the person has not spoken', async () => {
   const { firstWriteCard } = await import('../src/craft.mjs')
-  assert.match(firstWriteCard(false)[0], /先停下，对用户复述/)
-  assert.doesNotMatch(firstWriteCard(true)[0], /复述/)
-  assert.match(firstWriteCard(true)[0], /一次只改一处/)
-  assert.match(firstWriteCard(true, { command: 'npm test' })[0], /跑就写 `npm test`；要截短输出就写 `set -o pipefail; npm test 2>&1 \| tail -40`/)
+  assert.match(firstWriteCard(true)[0], /先停下，对用户复述/)
+  assert.doesNotMatch(firstWriteCard(false)[0], /复述/)
+  assert.match(firstWriteCard(false)[0], /一次只改一处/)
+  assert.match(firstWriteCard(false, { command: 'npm test' })[0], /跑就写 `npm test`；要截短输出就写 `set -o pipefail; npm test 2>&1 \| tail -40`/)
 })

@@ -17,7 +17,7 @@ export function taskStatus(task, plan, decisions = []) {
     task: { id: task.id, mode: task.mode, effectiveMode: effectiveMode(task.mode), state: task.state,
       request: task.request, goal: task.goal, scope: task.scope, project: task.project,
       ...taskEvidenceView(task, plan), acceptanceMode: task.acceptanceMode === 'auto' ? 'auto' : 'pm',
-      hasReceipt: Boolean(task.receipt), goalRevision: (task.goalHistory ?? []).length,
+      hasReceipt: Boolean(task.receipt), auto: task.auto === true, goalRevision: (task.goalHistory ?? []).length,
       ...((task.goalHistory ?? []).length > 1 ? { goalHistory: task.goalHistory.slice(0, -1).map(row => row.text) } : {}) },
     progress: planProgress(normalizedPlan.units, task.ledger),
     current: nextUnit(normalizedPlan) ?? null,

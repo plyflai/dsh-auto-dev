@@ -2,7 +2,7 @@ import { decisionSource } from '../decisions.mjs'
 import { text } from '../task.mjs'
 import { nextUnit, unitsIn } from '../plan.mjs'
 import { workSubmit } from './submit.mjs'
-import { string, containersOf, childrenOf, STEP_WORD, DAILY_UNIT, withDaily, dailyWarning, groupUnder } from './shared.mjs'
+import { string, containersOf, childrenOf, STEP_WORD, DAILY_UNIT, withDaily, dailyWarning, groupUnder, stepName } from './shared.mjs'
 
 export const workPlan = api => (
   // ----------------------------------------------------------------- work_plan
@@ -47,7 +47,7 @@ export const workPlan = api => (
       api.queueNotice(exec.agent,
         `**新主题 · ${theme.goal}** — ${insideUnits.length} 个单元`,
         `dsh-auto-dev theme ${themeId}`,
-        { form: 'theme-open', data: { unit: themeId, label: theme.goal, line: `${insideUnits.length} 个单元：${insideUnits.map(unit => unit.id).join(' → ')}`, tone: 'neutral' } })
+        { form: 'theme-open', data: { unit: themeId, label: theme.goal, line: `${insideUnits.length} 步：${insideUnits.map(unit => unit.goal).join(' → ')}`, tone: 'neutral' } })
       return { ...written, unit: themeId, grouped: members }
     }
     if (operation === 'organize') {
@@ -77,9 +77,8 @@ export const workPlan = api => (
       }
       // The person's reply after the proposal decides; no reply yet, or a no, changes nothing.
       const source = decisionSource({ agent: exec.agent, task, after: proposal.atSeq ?? task.startedSeq, subject: proposal.id })
-      if (!source || source.refused) {
-        return { ...api.planView(task, currentPlan), unchanged: true,
-          answer: !source ? '用户还没回话：等他对提案点头再整理。' : `用户没同意（「${source.quote.slice(0, 60)}」）：按他说的改提案，或者不整理。` }
+      if (!source) {
+        return { ...api.planView(task, currentPlan), unchanged: true, answer: '用户还没回话：等他对提案点头再整理。' }
       }
       let rows = (currentPlan.units ?? []).map(row => ({ ...row }))
       // Each step the user agreed to is applied when it names something real; the rest are skipped and said.
@@ -137,7 +136,7 @@ export const workPlan = api => (
         api.queueNotice(exec.agent,
           `**新主题 · ${theme.goal}** — ${inside} 个单元`,
           `dsh-auto-dev theme ${theme.id}`,
-          { form: 'theme-open', data: { unit: theme.id, label: theme.goal, line: `${inside} 个单元：${insideUnits.map(unit => unit.id).join(' → ')}`, tone: 'neutral' } })
+          { form: 'theme-open', data: { unit: theme.id, label: theme.goal, line: `${inside} 步：${insideUnits.map(unit => unit.goal).join(' → ')}`, tone: 'neutral' } })
       }
       const warning = dailyWarning(written)
       return warning ? { ...written, warning } : written
@@ -163,7 +162,7 @@ export const workPlan = api => (
       api.queueNotice(exec.agent,
         `**${args.unit} 需要你** — ${question}`,
         `dsh-auto-dev ask ${args.unit}`,
-        { form: 'ask', data: { unit: args.unit, title: `${args.unit} 需要你`, line: question, tag: '回一句即可', tone: 'ask' } })
+        { form: 'ask', data: { unit: args.unit, title: `${stepName(plan.units, args.unit)}要问你`, line: question, tag: '回一句即可', tone: 'ask' } })
       return { planId: updated.id, unit: args.unit, asked: question }
     }
     // The progress note: the least gated call in this tool. It verifies nothing
@@ -204,7 +203,7 @@ export const workPlan = api => (
         api.queueNotice(exec.agent,
           `**${args.unit} 开始** — ${deliverable}`,
           `dsh-auto-dev unit-start ${args.unit}`,
-          { form: 'unit-start', data: { unit: args.unit, title: `${args.unit} 开始`, line: deliverable, tag: before?.ref ? `已存档 #${before.seq}` : '未存档', tone: 'open' } })
+          { form: 'unit-start', data: { unit: args.unit, title: `开始${stepName(updated.units, args.unit)}`, line: deliverable, tag: before?.ref ? `已存档 #${before.seq}` : '未存档', tone: 'open' } })
       } else {
         // A unit starting is a visible event even when nobody wrote down what it
         // hands over. Without this, a plan where no unit names a deliverable
@@ -214,7 +213,7 @@ export const workPlan = api => (
         api.queueNotice(exec.agent,
           `**${args.unit} 开始** — ${started?.goal ?? args.unit}`,
           `dsh-auto-dev unit-open ${args.unit}`,
-          { form: 'unit-open', data: { unit: args.unit, title: `${args.unit} 开始`, line: String(started?.goal ?? args.unit).slice(0, 40), tone: 'open' } })
+          { form: 'unit-open', data: { unit: args.unit, title: `开始${stepName(updated.units, args.unit)}`, line: String(started?.goal ?? args.unit).slice(0, 40), tone: 'open' } })
       }
       return {
         planId: updated.id, unit: updated.units.find(unit => unit.id === args.unit), nextUnit: nextUnit(updated),
@@ -222,8 +221,17 @@ export const workPlan = api => (
         tellUser: '顺手给用户一句：现在开始哪个单元、为什么。工具调用不算对用户说话。',
       }
     }
-    // Done is a hand-in, so it goes through the one place that can say no (G1).
-    if (args.state === 'done') return workSubmit(api)[4]({ taskId: task.id, unit: args.unit, outcome: 'complete', summary: args.text }, exec)
+    // Done is a hand-in, so it goes through the one place that can say no (G1). A milestone
+    // marked done is every open leaf under it done, one card each (v52: only the first leaf closed).
+    if (args.state === 'done') {
+      const under = id => plan.units.filter(row => row.parent === id).flatMap(row => plan.units.some(kid => kid.parent === row.id) ? under(row.id) : [row])
+      const leaves = plan.units.some(row => row.parent === named) ? under(named).filter(row => !['done', 'dropped'].includes(row.state)) : []
+      let handed
+      for (const leaf of leaves.length ? leaves : [{ id: args.unit }]) {
+        handed = await workSubmit(api)[4]({ taskId: task.id, unit: leaf.id, outcome: 'complete', summary: args.text }, exec)
+      }
+      return handed
+    }
     let reduction
     // Dropping a unit is the model's call; it is recorded with whatever the person last said, and the model tells them.
     if (args.state === 'dropped') {
@@ -252,7 +260,7 @@ export const workPlan = api => (
           form: args.state === 'done' ? 'unit-done' : 'unit-blocked',
           data: {
             unit: args.unit,
-            title: `${args.unit} ${args.state === 'done' ? '完成' : '没通过'}`,
+            title: `${stepName(updated.units, args.unit)}${args.state === 'done' ? '完成' : '没通过'}`,
             line: finish,
             tag: finishMark?.ref ? `已存档 #${finishMark.seq}` : '未存档',
             tone: args.state === 'done' ? 'done' : 'blocked',

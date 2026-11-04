@@ -1,4 +1,4 @@
-import { consent, controlTransition, decisionSource } from '../decisions.mjs'
+import { CONSENT_ASK, consent, controlTransition, decisionSource } from '../decisions.mjs'
 import { GateError } from '../gate.mjs'
 import { rememberDomain } from '../domain.mjs'
 import { recordTask } from '../task-record.mjs'
@@ -8,7 +8,7 @@ import { string } from './shared.mjs'
 
 export const workControl = api => (
   // -------------------------------------------------------------- work_control
-  ['work_control', `Control pause/resume/cancel/accept/rework; record optionally stores goal/receipt/clarify/alternative/learning (or entries); legacy adapters remain. remember writes engineering/domain knowledge; adopt/export/import/checkpoints/rollback are indexed in references/operations.md. Rollback overwrites tracked workspace files; exported executions are history, not portable proof; records are not consent.`, {
+  ['work_control', `Control pause/resume/cancel/accept/rework; record optionally stores goal/receipt/clarify/learning (or entries); legacy adapters remain. remember writes engineering/domain knowledge; adopt/export/import/checkpoints/rollback are indexed in references/operations.md. Rollback overwrites tracked workspace files; exported executions are history, not portable proof; records are not consent.`, {
     taskId: string, operation: { type: 'string', enum: ['pause', 'resume', 'cancel', 'continue', 'adopt', 'export', 'import', 'checkpoints', 'rollback', 'remember', 'record', 'goal', 'receipt', 'clarify', 'postmortem', 'alternative', 'accept', 'rework', 'status'] }, reason: string, target: string, label: string, text: string, goal: string, assumption: string, sourceSeq: { type: 'integer' },
     asked: { type: 'array', items: { type: 'object', additionalProperties: true } },
     answers: { type: 'array', items: { type: 'object', additionalProperties: true } },
@@ -48,9 +48,6 @@ export const workControl = api => (
       // The person's own reply after the hand-in is the decision; the model's text is not.
       const source = decisionSource({ agent: exec.agent, task, after: task.review?.atSeq ?? 0, subject: task.id })
       if (!source) return { taskId: task.id, state: task.state, unchanged: true, tellUser: '用户还没回话：等他看过再说。' }
-      if (args.operation === 'accept' && source.refused) {
-        return { taskId: task.id, state: task.state, unchanged: true, tellUser: `用户的回话不是同意（「${source.quote.slice(0, 80)}」）：按他说的改，或者再问一句。` }
-      }
       const quote = source.quote
       const now = new Date().toISOString()
       if (args.operation === 'accept') {
@@ -130,11 +127,11 @@ export const workControl = api => (
       if (!pick) return { taskId: task.id, restored: false, checkpoints: rows.map(row => ({ ref: row.ref ?? row.commit, label: row.label, tag: row.tag })), tellUser: rows.length ? `没有「${label || target}」这个存档点，现有的列在 checkpoints 里。` : '这个任务还没有存档点，没法回滚。' }
       const action = `rollback ${pick.ref ?? pick.commit}`
       // G2: a rollback overwrites work that was never committed. Asked once, then the person's reply decides.
-      const asked = consent(api.sessionState(exec.agent), exec.agent, task, 'rollback', api.seq(exec.agent))
+      const asked = task.auto ? { granted: false } : consent(api.sessionState(exec.agent), exec.agent, task, 'rollback', api.seq(exec.agent))
       if (!asked.granted) {
-        throw new GateError('G2', `回滚会覆盖还没提交的改动（${action}）`, asked.refused
-          ? `用户没同意（「${asked.refused.slice(0, 60)}」）：换一个不丢改动的做法`
-          : `先问用户「要回到 ${pick.label || pick.ref || pick.commit} 吗？没提交的改动会丢」，他回了再回滚`)
+        throw new GateError('G2', `回滚会覆盖还没提交的改动（${action}）`, task.auto
+          ? '自动驾驶开着，不替用户丢改动：换一个不丢改动的做法，交付时把回滚列为「等你决定」'
+          : `${CONSENT_ASK}「要回到 ${pick.label || pick.ref || pick.commit} 吗？没提交的改动会丢」；他选「同意」再回滚，选「不同意」就换一个不丢改动的做法`)
       }
       const restored = await restoreCheckpoint(task.project, pick.commit)
       if (!restored.ok) return { taskId: task.id, restored: false, reason: restored.reason, tellUser: `回滚没成：${restored.reason}` }

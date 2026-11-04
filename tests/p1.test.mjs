@@ -167,12 +167,11 @@ test('P1 U07: unresolved questions and choices wait visibly; resolved records co
     // A new question must not inherit the old question's continuing assumption.
     assert.equal((await record('clarify', { asked: [{ q: '编码？' }] })).waiting, 'user-answer')
     await record('clarify', { answers: [{ q: '编码？', answer: 'UTF-8' }] })
-    assert.equal((await record('alternative', { text: '复用已有导出器？' })).waiting, 'user-choice')
-    assert.ok(h.notices.some(row => row.source.form === 'alternative' && row.source.data.tone === 'ask'))
+    // alternative is retired (F-clarify 6b): taken as history, never a card or a wait.
+    assert.equal((await record('alternative', { text: '复用已有导出器？' })).waiting, null)
+    assert.equal(h.notices.some(row => row.source.form === 'alternative'), false)
     board = h.board()
-    assert.equal(board.clarify.waiting, 'user-choice')
-    assert.match(board.next, /等待选择.*导出器/)
-    assert.equal((await record('alternative', { text: '复用已有导出器', verdict: 'kept' })).waiting, null)
+    assert.equal(board.clarify?.waiting ?? null, null)
     for (const kind of ['goal', 'receipt']) assert.equal((await record(kind, { text: '已说明的普通信息' })).continueAuthorized, true)
     const learning = await h.tool('work_control', legacy ? { operation: 'postmortem', text: '观察到 UTF-8 可用' }
       : { operation: 'record', payload: { kind: 'learning', text: '观察到 UTF-8 可用' } })
@@ -180,7 +179,7 @@ test('P1 U07: unresolved questions and choices wait visibly; resolved records co
   }
 })
 
-test('P1 U07: old alternatives remain advisory; both new interfaces mark actual pending choices', async () => {
+test('P1 U07: alternatives are history only, through both interfaces', async () => {
   for (const planned of [false, true]) for (const legacy of [false, true]) {
     const h = await harness()
     await begin(h)
@@ -196,14 +195,14 @@ test('P1 U07: old alternatives remain advisory; both new interfaces mark actual 
     assert.equal(result.continueAuthorized, true)
     const record = payload => h.tool('work_control', legacy ? { operation: 'alternative', ...payload }
       : { operation: 'record', payload: { kind: 'alternative', ...payload } })
-    assert.equal((await record({ text: '需要选择新方案？' })).waiting, 'user-choice')
-    assert.equal(h.task().alternatives.at(-1).pending, true)
+    assert.equal((await record({ text: '需要选择新方案？' })).waiting, null)
+    assert.equal(h.task().alternatives.at(-1).text, '需要选择新方案？')
     assert.equal((await record({ text: '需要选择新方案？', verdict: 'kept' })).waiting, null)
     assert.equal(h.board().clarify?.waiting ?? null, null)
   }
 })
 
-test('P1 U07: batch notices describe only the final unresolved question or choice', async () => {
+test('P1 U07: batch notices describe only the final unresolved question', async () => {
   for (const planned of [false, true]) {
     const h = await harness()
     await begin(h)
@@ -228,9 +227,8 @@ test('P1 U07: batch notices describe only the final unresolved question or choic
     assert.equal(waits().length, count + 1)
     assert.equal(waits().at(-1).source.data.line, '最终问题？')
     count = waits().length
-    assert.equal((await record([{ kind: 'clarify', answers: [{ q: '最终问题？', answer: '已回答' }] }])).waiting, 'user-choice')
-    assert.equal(waits().length, count + 1)
-    assert.equal(waits().at(-1).source.data.line, '另一个待选方案？')
+    assert.equal((await record([{ kind: 'clarify', answers: [{ q: '最终问题？', answer: '已回答' }] }])).waiting, null)
+    assert.equal(waits().length, count)
   }
 })
 

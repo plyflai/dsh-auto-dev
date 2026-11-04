@@ -6,13 +6,14 @@
  */
 import { randomUUID } from 'node:crypto'
 import { lossless } from './json.mjs'
+import { lastStartCommand } from './said.mjs'
 
 const CONTEXT_SUMMARY_MAX_CHARS = 120
 
 /** The `source.kind` every queued notice carries; the browser half claims cards by it. */
 export const NOTICE_KIND = 'dsh-auto-dev'
 
-export function createMailbox({ sessionState, sessionId }) {
+export function createMailbox({ sessionState, sessionId, openedSince = () => undefined }) {
   const intake = new Map()
   // Hooks: observe what ran. The user's own words are captured here because
   // authorizations and requests must always be quotable, never paraphrased.
@@ -84,12 +85,14 @@ export function createMailbox({ sessionState, sessionId }) {
   }
 
   // One grant per user-issued start: the command writes it, work_start spends it.
-  // Short-lived on purpose — a grant is about this intent, not a permission that
-  // lingers; a model that fumbles the call asks again instead of inheriting a blank.
-  const START_GRANT_TTL_MS = 15 * 60 * 1000
-  const grantStart = (agent, text) => {
+  // It lives until spent or replaced by the next start, in this session's memory
+  // only: registration now waits until the request is clear (F-clarify 6b), and
+  // the person may take a while to answer the question that clears it.
+  const grantStart = (agent, text, { auto = false } = {}) => {
     const state = sessionState(agent)
-    state.startGrant = { text: String(text ?? '').trim(), at: Date.now() }
+    const seq = agent?.session?.seq
+    state.startGrant = { text: String(text ?? '').trim(), at: Date.now(), seq: typeof seq === 'number' ? seq : 0, auto: auto === true }
+    state.startSpent = undefined
     state.startHinted = false
   }
   /**
@@ -97,18 +100,37 @@ export function createMailbox({ sessionState, sessionId }) {
    * Reading it does not spend the one start; only work_start does that.
    */
   const readStartGrant = agent => {
-    const grant = sessionState(agent).startGrant
-    if (!grant) return { ok: false, reason: 'nobody has run /dsh-auto-dev start in this conversation yet' }
-    if (Date.now() - (Number(grant.at) || 0) > START_GRANT_TTL_MS) {
-      return { ok: false, reason: 'the start grant from that command expired (15 minutes) — ask the person to run it again; the words are theirs, not yours' }
+    const state = sessionState(agent)
+    // After a host restart memory is empty; the person's start command is still in the log.
+    if (!state.startGrant && !state.startSpent) {
+      const command = lastStartCommand(agent?.session)
+      if (command) {
+        const taskId = openedSince(agent, command.seq)
+        if (taskId) state.startSpent = { taskId, seq: command.seq }
+        else state.startGrant = { text: command.text, at: Date.now(), seq: command.seq, auto: command.auto }
+      }
     }
-    return { ok: true, text: grant.text }
+    const { startGrant: grant, startSpent: spent } = state
+    // Spent is not the same fact as never started: the start opened a task here already.
+    if (!grant && spent) return { ok: false, spent, reason: `这次对话的 start 已经登记过任务 ${spent.taskId}` }
+    if (!grant) return { ok: false, reason: 'nobody has run /dsh-auto-dev start in this conversation yet' }
+    return { ok: true, text: grant.text, seq: grant.seq ?? 0, auto: grant.auto === true }
   }
-  const consumeStartGrant = agent => {
+  const consumeStartGrant = (agent, taskId) => {
     const verdict = readStartGrant(agent)
-    sessionState(agent).startGrant = undefined
+    const state = sessionState(agent)
+    if (state.startGrant) state.startSpent = { taskId, seq: state.startGrant.seq }
+    state.startGrant = undefined
     return verdict
   }
 
-  return { notice, queueNotice, blockedOnce, takeOutbox, queueReceipt, takeReceipts, intake, takeIntake, grantStart, readStartGrant, consumeStartGrant }
+  // The person's autopilot switch before the task is registered (it moves onto the record then).
+  const setGrantAuto = (agent, auto) => {
+    const grant = sessionState(agent).startGrant
+    if (!grant) return false
+    grant.auto = auto === true
+    return true
+  }
+
+  return { setGrantAuto, notice, queueNotice, blockedOnce, takeOutbox, queueReceipt, takeReceipts, intake, takeIntake, grantStart, readStartGrant, consumeStartGrant }
 }

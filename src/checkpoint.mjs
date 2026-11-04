@@ -75,12 +75,12 @@ export async function referencesTo(project, paths = []) {
  * @param {(prefix: string) => string} options.newId id factory for the sequence
  * @returns {Promise<{ok: boolean, skipped?: string, ref?: string, commit?: string, at?: string}>}
  */
-export async function captureCheckpoint(project, { slug, tag, seq }) {
+export async function captureCheckpoint(project, { slug, tag, seq, commit: kept }) {
   const inside = await git(project, ['rev-parse', '--is-inside-work-tree'], { allowFailure: true })
   if (!inside.ok || inside.out !== 'true') return { ok: false, skipped: 'not a git repository' }
   const head = await git(project, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
   if (!head.ok) return { ok: false, skipped: 'no commits yet' }
-  const created = await git(project, ['stash', 'create'], { allowFailure: true })
+  const created = kept ? { ok: true, out: kept } : await git(project, ['stash', 'create'], { allowFailure: true })
   if (!created.ok) return { ok: false, skipped: `checkpoint failed: ${created.reason}` }
   if (created.out === '') return { ok: false, skipped: 'no writes since the last commit' }
   const commit = created.out
@@ -88,6 +88,20 @@ export async function captureCheckpoint(project, { slug, tag, seq }) {
   const written = await git(project, ['update-ref', ref, commit], { allowFailure: true })
   if (!written.ok) return { ok: false, skipped: `checkpoint failed: ${written.reason}` }
   return { ok: true, ref, commit, at: new Date().toISOString() }
+}
+
+/**
+ * The tree at the person's start, before anything is registered: a `stash create`
+ * commit (HEAD when the tree is clean). Nothing points at it until a task pins it
+ * as its 「开工前」 save; unpinned, `git gc` drops it (大原则 8).
+ */
+export async function startTree(project) {
+  const inside = await git(project, ['rev-parse', '--is-inside-work-tree'], { allowFailure: true })
+  if (!inside.ok || inside.out !== 'true') return undefined
+  const created = await git(project, ['stash', 'create'], { allowFailure: true })
+  if (created.ok && created.out) return created.out
+  const head = await git(project, ['rev-parse', '--verify', 'HEAD'], { allowFailure: true })
+  return head.ok && head.out ? head.out : undefined
 }
 
 /**

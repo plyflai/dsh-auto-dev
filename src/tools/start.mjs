@@ -1,19 +1,20 @@
 import { startLines } from '../craft.mjs'
-import { markStart, storedPrint } from '../disk.mjs'
+import { markStart, marksOf, storedPrint } from '../disk.mjs'
 import { noteTrail } from '../trail.mjs'
 import { domainExists, domainPath } from '../domain.mjs'
 import { ACCEPTANCE_MODES, MODES, acceptanceModeOf, modeOf, createTaskRecord, texts, text } from '../task.mjs'
 import { nextUnit } from '../plan.mjs'
 import { ENV_FILE, envDigest, envLine, readEnv } from '../env.mjs'
-import { existsSync } from 'node:fs'
+import { existsSync, statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { resolveScopeRoot } from '../scope-root.mjs'
 import { memoryBrief, readLegacyLearning, readMemory } from '../memory.mjs'
 import { string, strings, planUnits } from './shared.mjs'
+import { repliesAfter } from '../decisions.mjs'
 
 export const workStart = api => (
   // ---------------------------------------------------------------- work_start
-  ['work_start', `Open the task the user started with /dsh-auto-dev start. Only request matters; everything else is optional and the plugin fills it from the repository (scope defaults to the whole project).`, {
+  ['work_start', `Register the task the user started with /dsh-auto-dev start, once the request is clear: request is your restatement of what they want (the plugin keeps their own words and replies beside it). Everything else is optional and the plugin fills it from the repository (scope defaults to the whole project).`, {
     request: string, goal: string, program: string, mode: { type: 'string', enum: MODES },
     // Who declares the result done. Stated at start because it decides what the
     // last delivery does: park for a person, or close on the checks.
@@ -29,20 +30,43 @@ export const workStart = api => (
     // call is refused. This is not a safety gate, it is ownership: the board must
     // show work a person asked for, not work a model decided to book on its own.
     const config = api.settings()
-    const startGrant = config.requireUserStart ? api.consumeStartGrant(agent) : undefined
+    // Read now, spent only once the record is written: a call that throws keeps the person's start.
+    const startGrant = config.requireUserStart ? api.readStartGrant(agent) : undefined
     // The user's start already opened the task (hooks register it before the model's
     // turn and use the grant). A second call must hear that fact, not "nobody started".
     const open = config.requireUserStart && !startGrant?.ok ? api.activeTask(agent) : undefined
-    if (open) return { started: true, taskId: open.id, project: open.project, already: true,
-      tellUser: `任务 ${open.id} 已经在跑（用户开工时就登记了），不用再开；直接干活。` }
+    if (open) {
+      // The plugin registered the person's words when the tree moved; the model's
+      // restatement still belongs on the record as the goal.
+      const restated = [text(args.request, 20000), text(args.goal, 20000)].filter(words => words && words !== open.request).join('\n')
+      if (open.registeredBy === 'plugin' && restated && !open.goal) {
+        await api.records.change('tasks', open.id, current => ({ ...current, goal: restated, updatedAt: new Date().toISOString() }))
+      }
+      return { started: true, taskId: open.id, project: open.project, already: true,
+        tellUser: `任务 ${open.id} 已经登记过，不用再开。` }
+    }
+    if (config.requireUserStart && startGrant?.spent) {
+      const spent = api.records.get('tasks', startGrant.spent.taskId)
+      return { started: false, taskId: startGrant.spent.taskId,
+        tellUser: `用户这次的 start 已经登记过任务 ${startGrant.spent.taskId}${spent?.state ? `（现在 ${spent.state}）` : ''}；要再开一件，请用户再输入一次 /dsh-auto-dev start <要做的事>。` }
+    }
     if (config.requireUserStart && !startGrant?.ok) {
       return { started: false, waiting: 'user-start',
         tellUser: `这里的任务由用户自己开：没开就照常干活，不用登记；要追踪的话请用户输入 /dsh-auto-dev start <要做的事>。（${startGrant?.reason ?? '这次对话没有开工授权'}）` }
     }
     const grantedWords = startGrant && typeof startGrant.text === 'string' && startGrant.text.trim() !== ''
       ? startGrant.text.trim() : undefined
-    // The user's own words win over the model's retelling of them.
-    const request = grantedWords ?? (text(args.request, 20000) || text(args.goal) || '（没写需求）')
+    // The user's own words stay the request; the model's restatement of them is the goal.
+    const modelWords = text(args.request, 20000)
+    const request = grantedWords ?? (modelWords || text(args.goal) || '（没写需求）')
+    const restated = grantedWords && modelWords && modelWords !== grantedWords ? modelWords : ''
+    const goal = [restated, text(args.goal, 20000)].filter(Boolean).join('\n')
+    // What the person said between the start and now, verbatim from the log (≤8, each ≤500;
+    // it lives and goes with the task record). The start words themselves are not a reply.
+    const openedSeq = startGrant?.ok ? startGrant.seq : undefined
+    const replies = openedSeq === undefined ? [] : repliesAfter(agent, openedSeq - 1)
+      .filter(reply => !/^\/dsh-auto-dev\b/.test(reply.text) && reply.text !== grantedWords && !(grantedWords && reply.text.endsWith(grantedWords)))
+      .slice(-8).map(reply => ({ seq: reply.seq, text: reply.text.slice(0, 500) }))
     // The user's words decide a look task; the model's mode only when it names one.
     const mode = args.mode ? modeOf(args.mode) : 'do'
     const acceptanceMode = acceptanceModeOf(args.acceptanceMode, mode)
@@ -64,23 +88,35 @@ export const workStart = api => (
     // to say so — the task was rooted in the parent's folder and every write came
     // back "outside the declared scope".
     const declared = typeof args.project === 'string' ? args.project.trim() : ''
-    const root = declared
-      ? { project: api.assertDirectory(declared, 'project') }
+    // A project name the model gives is read against the session's folder; one that is
+    // not a directory there is dropped, not refused (大原则 2: shape is never a rejection).
+    const named = declared && [isAbsolute(declared) ? declared : join(api.projectOf(agent) ?? '', declared), join(api.projectOf(agent) ?? '', '..', declared)]
+      .find(candidate => { try { return statSync(candidate).isDirectory() } catch { return false } })
+    const root = named
+      ? { project: api.assertDirectory(named, 'project') }
       : resolveScopeRoot(api.projectOf(agent, scope), scope)
     const record = createTaskRecord({
       id, project: root.project, sessionId: api.sessionId(agent), ownerId: agent.id,
-      request, goal: typeof args.goal === 'string' ? args.goal.trim() : '', mode, acceptanceMode,
+      request, goal, mode, acceptanceMode,
       program: typeof args.program === 'string' ? args.program.trim() : '',
       scope, acceptance, deliverable: args.deliverable,
-      startedSeq: api.seq(agent), startedTurn: exec.turn ?? 0, now,
+      startedSeq: openedSeq ?? api.seq(agent), startedTurn: exec.turn ?? 0, now,
     })
-    await api.records.change('tasks', id, () => record)
+    await api.records.change('tasks', id, () => ({ ...record,
+      ...(openedSeq !== undefined ? { openedSeq } : {}), ...(replies.length ? { replies } : {}),
+      ...(exec.registeredBy === 'plugin' ? { registeredBy: 'plugin' } : {}),
+      // The person's autopilot switch, set with the start; it travels with the task (handoff keeps it).
+      ...(startGrant?.auto ? { auto: true } : {}) }))
+    if (startGrant?.ok) api.consumeStartGrant(agent, id)
     const state = api.sessionState(agent)
     state.taskId = id
-    // The tree the task starts from: what 删除 and 收尾 compare to.
-    const startPrint = await markStart(root.project, id)
+    // The tree at the person's start, when it is this project's: what 删除 and 收尾
+    // compare to, and the 「开工前」 save — not the tree after the model's first moves.
+    const tree = state.startTree?.project === root.project ? state.startTree : undefined
+    state.startTree = undefined
+    const startPrint = await markStart(root.project, id, tree?.print)
     // The same tree on the record, for a window that picks the task up later (交接).
-    await noteTrail(api.records, id, () => ({ start: storedPrint(startPrint) }))
+    await noteTrail(api.records, id, () => ({ start: storedPrint(startPrint, { incidentsAt: marksOf(id).incidentsAt }) }))
     // A plan that arrives in a shape we cannot read used to be dropped in silence: the
     // task came back looking like a normal build task with no units, and the next call
     // said "this task has no plan". Accept both spellings, and refuse anything else.
@@ -89,7 +125,7 @@ export const workStart = api => (
     // that proves each one comes from the repository, not from a guess.
     const compiled = units ? api.compileReport(root.project, units) : undefined
     let task = api.records.get('tasks', id)
-    const before = mode === 'look' ? { snapshot: 'skipped', reason: 'look does not write' } : await api.snapshot(task, 'before')
+    const before = await api.snapshot(task, 'before', tree?.commit ? { commit: tree.commit, label: '开工前' } : {})
     task = api.records.get('tasks', id)
     // What this project has already learned goes out with the task: a memory that
     // has to be asked for is a memory nobody reads.
@@ -107,7 +143,6 @@ export const workStart = api => (
       : []
     // An empty scope is the whole project and an empty acceptance is "the project's
     // checks pass": both are defaults, not omissions to report (门禁定义 ②).
-    const modelWords = typeof args.request === 'string' ? args.request.trim() : ''
     const replacedRequest = Boolean(grantedWords) && modelWords !== '' && modelWords !== grantedWords
     const env = envDigest(await readEnv(task.project))
     return {
@@ -127,7 +162,7 @@ export const workStart = api => (
       ...(task.program ? { program: task.program } : {}),
       scope: task.scope, acceptance: task.acceptance,
       // Say which words became the record when both were on the table.
-      ...(grantedWords ? { requestSource: replacedRequest ? 'person (model wording dropped)' : 'person' } : {}),
+      ...(grantedWords ? { requestSource: replacedRequest ? 'person; your restatement kept as the goal' : 'person' } : {}),
       ...(warnings.length ? { warnings } : {}),
       gates: api.gatesFor(mode),
       checkpoint: before,

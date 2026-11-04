@@ -23,8 +23,9 @@ export function approvedReduction(task, plan, unit) {
 export function taskEvidenceView(task, plan) {
   const last = (task.ledger ?? []).at(-1)
   const unverified = [...(last?.residue ?? []), ...(last?.limitations ?? [])]
+  // Units still to do are the step list's to show; only what was cut from the scope is a 「没做的」.
   for (const unit of leafUnits(plan?.units ?? [])) {
-    if (unit.state === 'done') continue
+    if (unit.state !== 'dropped') continue
     const reduced = approvedReduction(task, plan, unit)
     unverified.push(`${unit.id} · ${unit.goal} · ${reduced ? '已批准移出范围，未完成' : unit.state ?? 'pending'}`)
   }

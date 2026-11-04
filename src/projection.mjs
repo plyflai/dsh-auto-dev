@@ -16,6 +16,7 @@ import { taskStatus, planProgress } from './status.mjs'
 import { modeLabel } from './mode.mjs'
 import { resultFailed } from './session-log.mjs'
 import { invariant } from './gate.mjs'
+import { shownGoal, themeState } from './tools/shared.mjs'
 
 // The project's own check, run plainly: the same exact match the hooks use (src/facts.mjs).
 const isCheck = (command, verifier) => typeof verifier === 'string' && verifier !== '' && command.trim() === verifier.trim()
@@ -41,6 +42,7 @@ const EMPTY = Object.freeze({
   acceptanceMode: null,
   goalRevision: 0,
   hasReceipt: null,
+  auto: false,
   clarify: null,
   // The project's tasks in time order, as the record sees them. A board answers
   // "what is this" for one task; the timeline answers "what has this project been
@@ -662,10 +664,7 @@ function groupsOfUnits(units, liveNotes, proofs) {
     const children = units.filter(unit => unit.parent === root.id)
     if (children.length === 0) continue
     // Same rule as the plan: half-landed is in progress, not "not started".
-    const state = children.every(child => child.state === 'done')
-      ? 'done'
-      : children.some(child => child.state === 'active') || children.some(child => child.state === 'done')
-        ? 'active' : (root.state ?? 'pending')
+    const state = themeState(children, root.state)
     groups.push({
       id: root.id,
       label: root.goal,
@@ -791,10 +790,11 @@ export function boardOf(state, live) {
     acceptance: current.acceptance ?? [],
     unverified: current.unverified ?? [],
     hasReceipt: Boolean(current.hasReceipt),
+    auto: current.auto === true,
     clarify: current.clarify ?? null,
     counting: total > 0 ? { done, total, label: `${done}/${total}` } : { done: 0, total: 0, label: current.submits > 0 || ['review_ready', 'closed'].includes(current.taskState) ? '已交付' : '未开始' },
     units: current.units.map(unit => ({
-      id: unit.id, goal: unit.goal, state: unit.state,
+      id: unit.id, goal: shownGoal(current.units, unit), state: unit.state,
       // The newest progress line, verbatim, plus the trail the expander opens.
       // The panel may decide how to show it; the fold only carries what was written.
       ...noteFields({ notes: notesOf(unit, childNotes) }),
@@ -908,6 +908,7 @@ export function syncState(state, store) {
   // Whether the work was agreed on before it started: a fact about the record,
   // not something the log can answer once the receipt was written elsewhere.
   const hasReceipt = task.receipt === undefined || task.receipt === null ? Boolean(current.hasReceipt) : true
+  const auto = task.auto === true
   // What the person was asked, and what the model assumed when they stayed quiet.
   const pending = facts.pending
   const clarify = task.clarify || pending.waiting
@@ -982,6 +983,7 @@ export function syncState(state, store) {
     && JSON.stringify(current.acceptance ?? []) === JSON.stringify(evidenceView.acceptance)
     && JSON.stringify(current.unverified ?? []) === JSON.stringify(evidenceView.unverified)
     && Boolean(current.hasReceipt) === hasReceipt
+    && (current.auto === true) === auto
     && JSON.stringify(current.clarify ?? null) === JSON.stringify(clarify)
     && current.project === project && current.units === units
     && current.checkpoints === checkpoints
@@ -991,7 +993,7 @@ export function syncState(state, store) {
     && sameMarks && current.seeded === signature) {
     return current
   }
-  return { ...current, acceptance: evidenceView.acceptance, unverified: evidenceView.unverified, taskId, mode, request, goal, goalRevision, taskState, acceptanceMode, hasReceipt, clarify, project, units, marks, checkpoints, timeline, proofs, reminders, seeded: signature }
+  return { ...current, acceptance: evidenceView.acceptance, unverified: evidenceView.unverified, taskId, mode, request, goal, goalRevision, taskState, acceptanceMode, hasReceipt, auto, clarify, project, units, marks, checkpoints, timeline, proofs, reminders, seeded: signature }
 }
 
 /**

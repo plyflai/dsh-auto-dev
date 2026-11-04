@@ -24,7 +24,7 @@ function strings(value) {
 
 /** What a unit is called when the model gave it something other than a goal. */
 function goalOf(unit) {
-  for (const key of ['goal', 'title', 'name', 'text', 'description', 'summary']) {
+  for (const key of ['goal', 'title', 'name', 'text', 'description', 'summary', 'step', 'content', 'task']) {
     if (typeof unit[key] === 'string' && unit[key].trim()) return unit[key].trim()
   }
   return ''
@@ -48,14 +48,37 @@ export const unitsIn = value => {
   return key ? value[key] : undefined
 }
 
-export function flattenUnits(units, parent = null, depth = 0, out = []) {
+const declaredId = unit => {
+  const raw = typeof unit?.id === 'number' ? String(unit.id) : unit?.id
+  return typeof raw === 'string' && ID_PATTERN.test(raw.trim()) ? raw.trim() : undefined
+}
+/** Every id the model wrote anywhere in the tree: an id the plugin makes up must not take one (v56 clarify). */
+const declaredIds = (units, into = new Set()) => {
+  const found = unitsIn(units)
+  for (const entry of Array.isArray(found) ? found : []) {
+    if (!entry || typeof entry !== 'object') continue
+    const id = declaredId(entry)
+    if (id) into.add(id)
+    declaredIds(unitsIn(entry), into)
+  }
+  return into
+}
+
+export function flattenUnits(units, parent = null, depth = 0, out = [], taken = declaredIds(units)) {
   const found = unitsIn(units)
   const list = Array.isArray(found) ? found : typeof found === 'string' && found.trim() ? [found] : []
+  let index = 0
   for (const entry of list) {
     const unit = typeof entry === 'string' ? (entry.trim() ? { goal: entry.trim() } : undefined) : entry
     if (!unit || typeof unit !== 'object' || Array.isArray(unit)) continue
-    const raw = typeof unit.id === 'number' ? String(unit.id) : unit.id
-    const id = typeof raw === 'string' && ID_PATTERN.test(raw.trim()) ? raw.trim() : `u${out.length + 1}`
+    index += 1
+    // An unnamed child is named after its parent (u1.1, u1.2); an unnamed top row takes the next free u<n>.
+    let id = declaredId(unit)
+    if (!id) {
+      let n = parent ? index : out.length + 1
+      do { id = parent ? `${parent}.${n}` : `u${n}`; n += 1 } while (taken.has(id))
+      taken.add(id)
+    }
     // Drop the nested children from the flat row: the walk already emitted them,
     // and a leftover `units: undefined` would travel into tool output, which the
     // host refuses as not-lossless JSON.
@@ -67,7 +90,7 @@ export function flattenUnits(units, parent = null, depth = 0, out = []) {
     // milestone's `parent` would otherwise be overwritten with null and the
     // milestone would be judged as a leaf that forgot its scope).
     out.push({ ...row, parent: unit.parent ?? parent, depth: unit.depth ?? depth })
-    if (Array.isArray(children)) flattenUnits(children, id, depth + 1, out)
+    if (Array.isArray(children)) flattenUnits(children, id, depth + 1, out, taken)
   }
   return out
 }
@@ -96,7 +119,13 @@ export function digestUnits(input) {
     ids.add(unit.id)
     const goal = goalOf(unit)
     if (!goal) fixed.push(`${unit.id} 没写目标`)
-    unit.goal = goal || `单元 ${unit.id}`
+    // No goal is an empty goal: the panel names it by position, never by its id (v56 「单元 u2」).
+    unit.goal = goal
+    // A todo-list shape (`status: completed|in_progress`) is the same unit state in other words.
+    if (!UNIT_STATES.includes(unit.state) && typeof unit.status === 'string') {
+      const state = { completed: 'done', done: 'done', in_progress: 'active', active: 'active', pending: 'pending', blocked: 'blocked', cancelled: 'dropped', dropped: 'dropped' }[unit.status.trim().toLowerCase()]
+      if (state) unit.state = state
+    }
     // `deliverable` is what a person would be shown when this unit lands: an
     // empty one is worse than none, so it is left out.
     if (unit.deliverable !== undefined && (typeof unit.deliverable !== 'string' || unit.deliverable.trim() === '')) delete unit.deliverable

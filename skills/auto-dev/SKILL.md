@@ -11,7 +11,7 @@ description: Practical methods for Auto Dev delivery, debugging, impact analysis
 
 | 场景 | 工具 | 产出 |
 | --- | --- | --- |
-| 已授权的请求 | `work_start` | 任务、范围、验收及已有项目知识 |
+| 已授权的请求，需求理清后 | `work_start` | 任务、范围、验收及已有项目知识 |
 | 需要拆分、依赖或分组 | `work_plan` | 可选单元计划、当前叶子 |
 | 有阶段结果 | `work_submit` | 证据关联、进度、下一步或真实等待 |
 | 读状态或找执行证据 | `work_status` | summary / executions / board / tasks |

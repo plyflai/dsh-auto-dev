@@ -50,7 +50,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
       return { snapshot: 'skipped', reason: 'checkpoints are disabled in the dsh-auto-dev settings' }
     }
     const seq = (task.checkpoints ?? []).length + 1
-    const captured = await captureCheckpoint(task.project, { slug: slugOf(task), tag, seq })
+    const captured = await captureCheckpoint(task.project, { slug: slugOf(task), tag, seq, ...(meta.commit ? { commit: meta.commit } : {}) })
     const at = new Date().toISOString()
     if (!captured.ok) {
       await records.change('tasks', task.id, current => ({ ...current, checkpointSkipped: captured.skipped, updatedAt: at }))
@@ -283,7 +283,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
     const freshPlan = planOf(settled)
     return {
       taskId, adopted: true, from, project: settled.project, mode: settled.mode, state: settled.state,
-      request: settled.request ?? '',
+      request: settled.request ?? '', goal: settled.goal ?? '',
       ...(freshPlan ? planView(settled, freshPlan) : {}),
       checkpoints: checkpointView(settled),
       before: before.snapshot === 'captured' ? before : { snapshot: before.snapshot, reason: before.reason },

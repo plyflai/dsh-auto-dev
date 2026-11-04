@@ -5,18 +5,18 @@
  */
 import { randomUUID } from 'node:crypto'
 import { newestFirst } from './lookup.mjs'
-import { handoffCard } from './craft.mjs'
+import { autopilotCard, handoffCard } from './craft.mjs'
 
 // Verbs a person types after the command name. Anything else is a request:
 // `/dsh-auto-dev 给 slug 加 trim` is how someone actually asks for work, and
 // reading the first word as an unknown verb is what made the command look
 // broken — it answered as "status" and nothing started.
-export const COMMAND_VERBS = new Set(['start', 'new', 'status', 'tasks', 'adopt', 'organize', 'pause', 'resume', 'cancel', 'plan', 'help'])
+export const COMMAND_VERBS = new Set(['start', 'new', 'status', 'tasks', 'adopt', 'organize', 'pause', 'resume', 'cancel', 'plan', 'help', 'auto'])
 
 export function registerCommand(ctx, {
   records, sessionState, sessionId, projectOf, planOf, activeTask, latestTask,
   optIn, unfinishedElsewhere, adoptTask, proposeOrganize, statusView,
-  notice, queueReceipt, intake, grantStart,
+  notice, queueReceipt, intake, grantStart, readStartGrant, setGrantAuto,
 }) {
   const brief = (value, max = 120) => {
     const text = String(value ?? '').replace(/\s+/g, ' ').trim()
@@ -68,7 +68,10 @@ export function registerCommand(ctx, {
         const head = raw.split(/\s+/)[0]?.toLowerCase() ?? ''
         const known = COMMAND_VERBS.has(head)
         const operation = known ? head : (raw ? 'start' : 'status')
-        const rest = known ? raw.slice(raw.split(/\s+/)[0].length).trim() : raw
+        const tail = known ? raw.slice(raw.split(/\s+/)[0].length).trim() : raw
+        // `start --auto <words>`: the autopilot switch, said by the person with the start.
+        const autoStart = /^--auto(\s|$)/.test(tail)
+        const rest = autoStart ? tail.replace(/^--auto\s*/, '') : tail
         if (operation === 'start' || operation === 'new') {
           if (!rest) return { kind: 'error', text: '用法：/dsh-auto-dev start <用你自己的话说这次要做什么>（这个项目还有没做完的活时会先接管它；一定要另开新任务用 /dsh-auto-dev new <需求>）' }
           // This is the opt-in, and it happens before anything else the command
@@ -83,27 +86,38 @@ export function registerCommand(ctx, {
             const waiting = unfinishedElsewhere(agent)
             if (waiting.length > 0) {
               const adopted = await adoptTask({ taskId: waiting[0].id }, agent)
-              const resume = `继续 ${adopted.taskId}（${brief(adopted.request ?? '', 80)}）。用户这次说：「${rest}」。接手卡上是这个任务留下的事实；不要重新登记一个任务。`
+              const resume = `继续上次没做完的「${brief(adopted.goal || adopted.request || '', 80)}」。用户这次说：「${rest}」。接手卡上是这个任务留下的事实；不要重新登记一个任务。`
               const opened = openTurn(invocation, resume, attachments)
               const where = adopted.from === sessionId(agent) ? '本会话' : '别的会话'
               // 人刚点了一下，得先有一行东西证明"交接发生了"，否则要等模型
               // 调完第一个工具才看得见。这行随下一次 pre-step 一起到。
               queueReceipt(agent, notice(...await handoffCard(records.get('tasks', adopted.taskId), { from: where })))
-              if (opened.ok) return { kind: 'success', text: `这个项目有没做完的 ${adopted.taskId}（在${where}），已接管并交给模型继续：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}。要另开新任务用 /dsh-auto-dev new。` }
+              if (opened.ok) return { kind: 'success', text: `这个项目有没做完的「${brief(adopted.goal || adopted.request || '', 40)}」（在${where}），已接管并交给模型继续：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}。要另开新任务用 /dsh-auto-dev new。` }
               intake.set(sessionId(agent), { kind: 'adopt', taskId: adopted.taskId, from: adopted.from, at: new Date().toISOString() })
-              return { kind: 'success', text: `已接管 ${adopted.taskId}（在${where}），但没能直接开一轮（${opened.reason}）。发下一条消息，模型会先读进度再继续。` }
+              return { kind: 'success', text: `已接管「${brief(adopted.goal || adopted.request || '', 40)}」（在${where}），但没能直接开一轮（${opened.reason}）。发下一条消息，模型会先读进度再继续。` }
             }
           }
           // The words are the grant: work_start may be called only while this
           // fresh user-issued start is unspent.
-          grantStart(agent, rest)
+          grantStart(agent, rest, { auto: autoStart })
+          if (autoStart) queueReceipt(agent, notice(...autopilotCard(true)))
           // Hand the words to the model now. The intake slot stays the fallback:
           // a host that refuses to open a turn still delivers the request on the
           // person's next message instead of losing it.
           const opened = openTurn(invocation, rest, attachments)
-          if (opened.ok) return { kind: 'success', text: `已交给模型：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}\n任务已登记，进度看 /dsh-auto-dev status。` }
+          if (opened.ok) return { kind: 'success', text: `已交给模型：「${brief(rest)}」${attachments.length ? `，连同 ${attachments.length} 个附件` : ''}\n模型先理清需求再登记，进度看 /dsh-auto-dev status。` }
           intake.set(sessionId(agent), { kind: 'start', text: rest, at: new Date().toISOString() })
           return { kind: 'success', text: `记下了，但没能直接开一轮（${opened.reason}）。发下一条消息（哪怕只说「开始」），模型就会按这段话开工。附件这次没能带过去，请在下一轮重新贴。` }
+        }
+        // The autopilot switch, per task: on the task when there is one, else on the start not yet registered.
+        if (operation === 'auto') {
+          const on = /^(on|开)$/i.test(rest) ? true : /^(off|关)$/i.test(rest) ? false : undefined
+          if (on === undefined) return { kind: 'error', text: '用法：/dsh-auto-dev auto on 或 /dsh-auto-dev auto off' }
+          const task = activeTask(agent)
+          if (task) await records.change('tasks', task.id, current => ({ ...current, auto: on, updatedAt: new Date().toISOString() }))
+          else if (!setGrantAuto(agent, on)) return { kind: 'error', text: '这个会话还没有任务：用 /dsh-auto-dev start --auto <需求> 开一个自动驾驶的任务。' }
+          queueReceipt(agent, notice(...autopilotCard(on)))
+          return { kind: 'success', text: `自动驾驶${on ? '已打开' : '已关闭'}${task ? `（任务 ${task.id}）` : '（下一个登记的任务）'}。` }
         }
         if (operation === 'tasks') {
           const project = projectOf(agent, ['.'])
@@ -128,8 +142,8 @@ export function registerCommand(ctx, {
             `日需 ${proposal.daily.length} 件${proposal.daily.length ? `：${proposal.daily.slice(0, 8).join(', ')}` : ''}`,
             `战役主题 ${proposal.themes.length} 个${proposal.themes.length ? `：${proposal.themes.map(theme => `${theme.label}(${theme.units.length})`).join('、')}` : ''}`,
           ]
-          const opened = openTurn(invocation, `用户刚跑了 /dsh-auto-dev organize 体检。\n记录里现在是：${lines.join('；')}。\n请用 ask_user_question 问他：这份整理提案是否满意；不满意的话问他希望怎么整理（归组到哪个主题、哪些该拆开、哪个该改名）。他只说了「整理一下」不算同意。\n他点头后再按提案 ${proposal.id} 整理计划，只做他同意的那几步。`, attachments)
-          const notice = `已生成整理提案 ${proposal.id}（只写记录，计划没动）。\n${lines.join('\n')}`
+          const opened = openTurn(invocation, `用户刚跑了 /dsh-auto-dev organize 体检。\n记录里现在是：${lines.join('；')}。\n请用 ask_user_question 问他：这份整理提案是否满意；不满意的话问他希望怎么整理（归组到哪个主题、哪些该拆开、哪个该改名）。他只说了「整理一下」不算同意。\n他点头后再按这份提案整理计划，只做他同意的那几步。`, attachments)
+          const notice = `已生成整理提案（只写记录，计划没动）。\n${lines.join('\n')}`
           if (opened.ok) return { kind: 'success', text: `${notice}\n已经交给模型：它会用提问卡问你满不满意，你点头后才会改。` }
           return { kind: 'success', text: `${notice}\n没能直接开一轮（${opened.reason}）；发下一条消息，模型会先看到这份提案。` }
         }
@@ -143,7 +157,7 @@ export function registerCommand(ctx, {
           if (!adopted.taskId) return { kind: 'error', text: adopted.tellUser }
           // Continuing is the whole point of adopting, so the turn starts here
           // instead of waiting for the person to say "go" a second time.
-          const opened = openTurn(invocation, `继续 ${adopted.taskId}：「${brief(adopted.request ?? '', 80)}」。接手卡上是这个任务留下的事实。`, attachments)
+          const opened = openTurn(invocation, `继续「${brief(adopted.goal || adopted.request || '', 80)}」。接手卡上是这个任务留下的事实。`, attachments)
           if (opened.ok) {
             // The person watched a task move between windows; that is a fact about
             // their work, not about the model's next tool call.
@@ -151,13 +165,13 @@ export function registerCommand(ctx, {
               queueReceipt(agent, notice(...await handoffCard(records.get('tasks', adopted.taskId), { from: `会话 ${adopted.from ?? '另一处'}` })))
             }
             return { kind: 'success', text: adopted.adopted
-              ? `已接管 ${adopted.taskId}（原来在 ${adopted.from}），模型会先读进度再继续。`
-              : `任务 ${adopted.taskId} 本来就在这个会话里，已重新激活并让模型接着做。` }
+              ? `已接管「${brief(adopted.goal || adopted.request || '', 40)}」（原来在别的会话），模型会先读进度再继续。`
+              : `「${brief(adopted.goal || adopted.request || '', 40)}」本来就在这个会话里，已重新激活并让模型接着做。` }
           }
           intake.set(sessionId(agent), { kind: 'adopt', taskId: adopted.taskId, from: adopted.from, at: new Date().toISOString() })
           return { kind: 'success', text: adopted.adopted
-            ? `已接管 ${adopted.taskId}（原来在 ${adopted.from}）。发下一条消息，模型会先读它的进度再继续。`
-            : `任务 ${adopted.taskId} 本来就在这个会话里，已重新激活。` }
+            ? `已接管「${brief(adopted.goal || adopted.request || '', 40)}」（原来在别的会话）。发下一条消息，模型会先读它的进度再继续。`
+            : `「${brief(adopted.goal || adopted.request || '', 40)}」本来就在这个会话里，已重新激活。` }
         }
         const task = activeTask(agent)
         if (!task) {

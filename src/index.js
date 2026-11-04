@@ -287,8 +287,10 @@ async function applyInner(ctx, config) {
 
   const { checkpointView, gatesFor, assertPlan, compileReport, planView, leafOf, boardView, statusView } =
     createViews({ records, timelineForProject })
-  const { notice, queueNotice, blockedOnce, takeOutbox, queueReceipt, takeReceipts, intake, takeIntake, grantStart, readStartGrant, consumeStartGrant } =
-    createMailbox({ sessionState, sessionId })
+  const { setGrantAuto, notice, queueNotice, blockedOnce, takeOutbox, queueReceipt, takeReceipts, intake, takeIntake, grantStart, readStartGrant, consumeStartGrant } =
+    // A task this session opened at or after `seq` (the start command's place in the log): the start was spent.
+    createMailbox({ sessionState, sessionId, openedSince: (agent, at) => records.all('tasks', task =>
+      (task.sessions ?? [task.sessionId]).includes(sessionId(agent)) && (task.openedSeq ?? task.startedSeq ?? -1) >= at)[0]?.id })
   const { proposeOrganize, slugOf, snapshot, newId, exportSnapshot, importSnapshot, unfinishedElsewhere, adoptTask, requireTask, noTask, setUnits } =
     createTaskOps({ records, settings, sessionState, sessionId, seq, projectOf, planOf, latestTask, planView, checkpointView })
 
@@ -324,7 +326,7 @@ async function applyInner(ctx, config) {
     planOf, activeTask, latestTask, watchedTask, requireTask, noTask,
     newId, slugOf, snapshot, checkpointView, setUnits, assertPlan, leafOf, gatesFor, compileReport,
     planView, boardView, statusView, proposeOrganize, adoptTask, exportSnapshot, importSnapshot,
-    queueNotice, blockedOnce, consumeStartGrant, childWork,
+    queueNotice, blockedOnce, consumeStartGrant, readStartGrant, childWork,
   })
 
   const { optedIn, optIn, markUserSpoke } = await setupOptIn({
@@ -333,14 +335,27 @@ async function applyInner(ctx, config) {
   registerCommand(ctx, {
     records, sessionState, sessionId, projectOf, planOf, activeTask, latestTask,
     optIn, unfinishedElsewhere, adoptTask, proposeOrganize, statusView,
-    notice, queueReceipt, intake, grantStart,
+    notice, queueReceipt, intake, grantStart, readStartGrant, setGrantAuto,
   })
   const hookApi = () => ({
     records, settings, sessionState, sessionId, seq, nudged, denied, observationsOf, projectOf, newId,
     planOf, activeTask, latestTask, stoppedTask, optedIn, markUserSpoke, unfinishedElsewhere,
-    notice, takeOutbox, queueReceipt, takeReceipts, takeIntake, grantStart, readStartGrant, blockedOnce, snapshot,
-    // The user's start is the registration: it spends the grant, so the model never fills a form to begin.
-    startTask: (agent, request) => workStart(toolApi())[4]({ request }, { agent, callId: 'dsh-auto-dev-start' }),
+    notice, queueNotice, takeOutbox, queueReceipt, takeReceipts, takeIntake, grantStart, readStartGrant, blockedOnce, snapshot,
+    // The host's own yes/no card: there when the host has an approval service and this
+    // session's policy (the last `approval/policy` event, default ask) still asks people.
+    hostAsks: agent => {
+      let approval
+      try { approval = ctx.get('approval') } catch { approval = undefined }
+      if (!approval || typeof approval.request !== 'function') return false
+      const session = agent?.session
+      for (let at = (session?.seq ?? 0) - 1; at >= 0; at -= 1) {
+        const event = session.eventAt?.(at)
+        if (event?.type === 'approval/policy') return event.data?.policy !== 'never'
+      }
+      return true
+    },
+    // The fallback registration (a file write before the model registered): the person's words, marked as the plugin's.
+    startTask: (agent, request, options = {}) => workStart(toolApi())[4]({ request }, { agent, callId: 'dsh-auto-dev-start', ...options }),
     // The model saying it is done is the hand-in; G1 still decides. Same path as work_submit.
     handIn: (agent, summary) => workSubmit(toolApi())[4]({ outcome: 'complete', summary }, { agent, callId: 'dsh-auto-dev-settle' }),
   })

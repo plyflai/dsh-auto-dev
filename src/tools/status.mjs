@@ -42,7 +42,7 @@ export const workStatus = api => (
       }
     }
     const readable = task ?? api.watchedTask?.(exec.agent)
-    if (!readable) return { task: null, hint: "no task in this session yet: call work_start with the user's own words" }
+    if (!readable) return { task: null, hint: "这次对话还没有登记任务" }
     const plan = api.planOf(readable)
     const status = api.statusView(readable, plan)
     const value = view === 'board' ? api.boardView(readable, plan, api.records.all('decisions', row => row.taskId === readable.id))

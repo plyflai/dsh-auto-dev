@@ -17,10 +17,9 @@
 | goal | `text`，可附 `why` |
 | receipt | `text`，表示理解，不表示用户确认 |
 | clarify | `asked:[{question}]`（兼容 `q`）、`answers:[{q,answer}]`、`assumption` |
-| alternative | `text`；明确选择后 `verdict:kept/switched`，可附真实 `quote` |
 | learning | `text` 或 `symptom/cause/change/finding/prevention/ruledOut/check/lesson`；未知原因可省略 |
 
-只记录影响目标、验收、下一步或复用的信息。真实未答问题且无继续假设、真实未选方案才等待。旧 `goal/receipt/clarify/alternative/postmortem` 入口保留；`postmortem` 现在写 memory，不再追加旧复盘文件。
+只记录影响目标、验收、下一步或复用的信息。真实未答问题且无继续假设才等待。更好的做法直接在对话里问用户，定了再登记。旧 `goal/receipt/clarify/alternative/postmortem` 入口保留（`alternative` 只记历史）；`postmortem` 现在写 memory，不再追加旧复盘文件。
 
 ## 控制与验收
 

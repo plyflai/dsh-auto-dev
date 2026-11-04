@@ -1,4 +1,4 @@
-import { consent, decisionSource, repliesAfter } from '../decisions.mjs'
+import { CONSENT_ASK, consent, decisionSource, repliesAfter } from '../decisions.mjs'
 import { GateError } from '../gate.mjs'
 import { text } from '../task.mjs'
 import { ENV_FILE, FACT_KINDS, MAX_FACTS, envDigest, envLine, readEnv, writeEnv } from '../env.mjs'
@@ -90,7 +90,6 @@ export const workEnv = api => (
       // The person's reply after the candidate was written decides; until then it stays a candidate.
       const source = decisionSource({ agent: exec.agent, task, after: pending.source?.seq ?? task.startedSeq, subject: pending.key })
       if (!source) return answer(`问用户一句「${pending.key} = ${pending.value}，对吗？」，他回了再确认。`)
-      if (source.refused) return answer(`用户没确认（「${source.quote.slice(0, 60)}」），这条留在候选里。`)
       const original = (env[section === 'fact' ? 'facts' : section] ?? []).find(row => row.key === pending.key)
       const confirmed = {
         ...pending, status: 'confirmed', at: now,
@@ -119,12 +118,12 @@ export const workEnv = api => (
       // G3: a rule the person set is lifted only by the person — asked once, then their reply decides.
       let lifted
       if (protectedRules.length) {
-        const asked = consent(api.sessionState(exec.agent), exec.agent, task, `revoke:${protectedRules.map(row => row.key).join(',')}`, api.seq(exec.agent))
+        const asked = task.auto ? { granted: false } : consent(api.sessionState(exec.agent), exec.agent, task, `revoke:${protectedRules.map(row => row.key).join(',')}`, api.seq(exec.agent))
         if (!asked.granted) {
           const named = protectedRules.map(row => `「${row.value}」`).join('、')
-          throw new GateError('G3', `${named} 是用户定的规则`, asked.refused
-            ? `用户没同意解除（「${asked.refused.slice(0, 60)}」）：照规则来，改走别的路`
-            : `先问用户要不要解除 ${named}，他回了再改`)
+          throw new GateError('G3', `${named} 是用户定的规则`, task.auto
+            ? '自动驾驶开着，不替用户解除他定的规则：照规则来，交付时把这一步列为「等你决定」'
+            : `${CONSENT_ASK}要不要解除 ${named}；他选「同意」再改，选「不同意」就照规则来、别再改这条`)
         }
         lifted = { sessionId: api.sessionId(exec.agent), taskId: task.id, ...asked.source }
       }

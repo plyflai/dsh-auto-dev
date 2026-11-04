@@ -9,8 +9,6 @@ export function recordWaiting(task) {
   const answered = new Set((clarify?.answers ?? []).map(row => row.q))
   const questions = (clarify?.asked ?? []).filter(row => !answered.has(row.q)).map(row => row.q)
   if (questions.length && !clean(clarify?.assumption)) return { waiting: 'user-answer', lines: questions }
-  const alternative = task.alternatives?.at(-1)
-  if (alternative?.pending && !alternative.verdict) return { waiting: 'user-choice', lines: [alternative.text] }
   return { waiting: null, lines: [] }
 }
 
@@ -88,7 +86,9 @@ export async function recordTask(api, task, args, exec) {
       }, updatedAt: now }))
       result = { clarify: { asked: task.clarify.asked.length, answered: task.clarify.answers.length, assumption: task.clarify.assumption ?? null } }
     } else {
-      const alternative = { text: entry.text, at: now, by, pending: !entry.verdict,
+      // Retired channel (F-clarify 6b: a better way is asked in the conversation, before
+      // registering). An old call is still taken, kept as history only: no card, no waiting.
+      const alternative = { text: entry.text, at: now, by,
         ...(entry.verdict ? { verdict: entry.verdict, quote: clean(entry.quote) } : {}) }
       task = await api.records.change('tasks', task.id, current => ({ ...current, alternatives: [...(current.alternatives ?? []), alternative], updatedAt: now }))
       result = { alternatives: task.alternatives.length, ...(entry.verdict ? { verdict: entry.verdict } : {}) }
@@ -96,12 +96,10 @@ export async function recordTask(api, task, args, exec) {
     results.push({ kind: entry.kind, ...result })
   }
   const pending = recordWaiting(task)
-  if (entries.some(entry => ['clarify', 'alternative'].includes(entry.kind))) {
+  if (entries.some(entry => entry.kind === 'clarify')) {
     const line = pending.lines.join('；')
     if (pending.waiting === 'user-answer') api.queueNotice(exec.agent, `**需要回答** — ${line}`, 'dsh-auto-dev clarify',
       { form: 'ask', data: { unit: task.id, title: '需要回答', line, tag: '等待回答', tone: 'ask' } })
-    if (pending.waiting === 'user-choice') api.queueNotice(exec.agent, `**有个更省事的做法** — ${line}`, 'dsh-auto-dev alternative',
-      { form: 'alternative', data: { unit: task.id, title: '有个更省事的做法', line, tag: '等待选择', tone: 'ask' } })
   }
   return { taskId: task.id, ...(results.length === 1 ? results[0] : { entries: results }), waiting: pending.waiting,
     continueAuthorized: task.state === 'active' && !pending.waiting,

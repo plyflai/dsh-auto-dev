@@ -1,6 +1,6 @@
-import { deletedCard, deliveryOnce, firstWriteCard, fixCard, fixedCard, handoffCard, reviewCard } from './craft.mjs'
-import { referencesTo } from './checkpoint.mjs'
-import { checkRuns, exactCheck, fixesIn, redStreak, tailOf } from './facts.mjs'
+import { clarifyCard, deletedCard, deliveryOnce, firstWriteCard, fixCard, fixedCard, handoffCard, quickFixCard, reviewCard } from './craft.mjs'
+import { referencesTo, startTree } from './checkpoint.mjs'
+import { checkRuns, exactCheck, fixesIn, quickFixesIn, redStreak, tailOf } from './facts.mjs'
 /**
  * The three observation points, and nothing else — plus one rescue.
  *
@@ -17,21 +17,22 @@ import { checkRuns, exactCheck, fixesIn, redStreak, tailOf } from './facts.mjs'
  * retry and silence.
  */
 import { resultFailed } from './session-log.mjs'
-import { fingerprint, markGreen, markStart, marksOf, storedPrint, vanished } from './disk.mjs'
+import { changedPaths, fingerprint, markGreen, markStart, marksOf, noteTouched, startOf, storedPrint, vanished } from './disk.mjs'
 import { noteTrail, withSaid } from './trail.mjs'
 import { filePathOf, risksOfCall } from './risk.mjs'
 import { createTaskRecord, windowObservations } from './task.mjs'
 import { nextUnit } from './plan.mjs'
 import { blockedBy, blockedCommand, readEnv } from './env.mjs'
 import { detectVerifier } from './detect.mjs'
-import { consent, spokeSinceStart } from './decisions.mjs'
+import { CONSENT_ASK, consent, spokeSinceStart } from './decisions.mjs'
 import { GATES, GateError } from './gate.mjs'
 import { callsSince, currentTurn, lastAssistant, pseudoCallOf, rescueMessage } from './pseudo-call.mjs'
+import { noticeSaid } from './said.mjs'
 
 
-/** What the model reads when the user's start registered the task: their words, and what this project already knows. */
+/** What the model reads when the plugin had to register the task at the first write: the words, and what this project already knows. */
 const startedBrief = (words, started) => [
-  `用户用 /dsh-auto-dev start 开了任务（${started.taskId}），原话逐字：「${words}」。已经登记好，直接开工，不用再问要不要开始。`,
+  `改文件前还没登记，已按用户原话登记（${started.taskId}），原话逐字：「${words}」。`,
   started.tellUser,
   ...(Array.isArray(started.brief) ? started.brief : []),
   started.memory?.facts?.length ? `这个项目记过的事实：${started.memory.facts.join('；')}` : '',
@@ -54,23 +55,6 @@ function personSaid(messages) {
   return ''
 }
 
-/**
- * Three answers matter after "做完了": yes, not yet (with a reason), and silence.
- *
- * The person answers in their own words, so this reads like a person: an explicit
- * yes, an objection, or anything else (which is treated as "not yet, keep quiet").
- */
-function reviewVerdict(said) {
-  const body = String(said).trim()
-  if (body === '') return 'ignore'
-  // A person rarely answers with one word: "我点开看过了，可以" is an acceptance.
-  // Anything that reads as a complaint wins, otherwise an approval word anywhere
-  // in the sentence counts. Anchoring on the first character missed both.
-  if (/不|别|缺|少|改|换|错|不对|丑|奇怪|再补|补一下|慢|卡|崩/.test(body)) return 'revise'
-  if (/(可以|行|好的|好嘞|没问题|通过|同意|就这样|收了|收尾|满意|不错|能用|能看|OK)/i.test(body)) return 'accepted'
-  if (/^(ok|okay|yes|pass|lgtm)\b/i.test(body)) return 'accepted'
-  return 'ignore'
-}
 
 
 /** Steps since the last assistant text or user message in the log; undefined when the log can't say. */
@@ -130,12 +114,15 @@ export function registerHooks(ctx, api) {
       out.push(saveNotice(unit, `修通 · ${fix.green.command}`, saved, 'done'))
       out.push(api.notice(...fixedCard(unit, fix)))
     }
+    // Red once, then green: the person sees it was fixed on the first try. Once per task.
+    const quick = quickFixesIn(runs).at(-1)
+    if (quick && once(`${task.id}:quick`) && !noticeSaid(agent.session, 'dsh-auto-dev quick fix', task.openedSeq ?? task.startedSeq ?? 0)) out.push(api.notice(...quickFixCard(unit, quick)))
     return out
   }
   // Files that were there when the task started and are gone now, while other
   // files still say their name. Each vanished file is looked up once.
   const deletedNotices = async (agent, task, now) => {
-    const gone = await vanished(task.project, marksOf(task.id).start, now)
+    const gone = await vanished(task.project, await startOf(task), now)
     if (!gone.length) return []
     const state = api.sessionState(agent)
     if (!(state.craftSeen instanceof Set)) state.craftSeen = new Set()
@@ -200,14 +187,17 @@ export function registerHooks(ctx, api) {
     let observed
     const observations = () => (observed ??= api.observationsOf(agent))
     const methodTask = active ?? latestTask()
-    if (methodTask && methodTask.mode !== 'look') {
+    if (methodTask) {
       const methodUnit = (api.planOf(methodTask)?.units ?? []).find(row => row.state === 'active')
-      const cards = await fixCards(agent, methodTask, methodUnit, windowObservations(observations(), methodTask, methodUnit).results)
+      // Red and green are the project's check over the whole task: switching steps between two reds
+      // does not reset them (v56 clarify: 「一次修通」 after two reds).
+      const cards = await fixCards(agent, methodTask, methodUnit, windowObservations(observations(), methodTask).results)
       if (cards.length) decision.messages = [...(decision.messages ?? []), ...cards]
     }
-    // 命令欠这个会话的一行（接手没有工具调用可以挂）。随下第一步一起到。
+    // 命令欠这个会话的一行（接手没有工具调用可以挂）。随下第一步一起到，且不挡住这一步该说的
+    // （自动驾驶胶囊和「先理需求」同一步到）。
     const owed = api.takeReceipts(agent)
-    if (owed.length) return { ...decision, messages: [...owed, ...(decision.messages ?? [])] }
+    if (owed.length) decision.messages = [...owed, ...(decision.messages ?? [])]
     // A slash command cannot address the model, so `/dsh-auto-dev start …` writes
     // the request down and this is where it reaches the one turn that can act on
     // it. Same for adopt: the record moved, but the model still has to read it.
@@ -219,10 +209,13 @@ export function registerHooks(ctx, api) {
       if (pending.kind === 'start') api.grantStart(agent, pending.text)
       const adopted = pending.kind === 'adopt' ? api.records.get('tasks', pending.taskId) : undefined
       if (adopted) return { ...decision, messages: [...decision.messages, api.notice(...await handoffCard(adopted, { from: `会话 ${pending.from ?? '另一处'}` }))] }
-      const body = pending.kind === 'start'
-        ? startedBrief(pending.text, await api.startTask(agent, pending.text))
-        : `任务 ${pending.taskId} 已经用 /dsh-auto-dev adopt 转到这个会话（来自 ${pending.from ?? '另一个会话'}）。`
-      return { ...decision, messages: [...decision.messages, api.notice(body, `dsh-auto-dev ${pending.kind}`)] }
+      if (pending.kind === 'start') {
+        api.sessionState(agent).startHinted = true
+        await noteStartTree(agent)
+        return { ...decision, messages: [...decision.messages, api.notice(...clarifyCard(pending.text, api.readStartGrant(agent).auto))] }
+      }
+      return { ...decision, messages: [...decision.messages, api.notice(
+        `任务 ${pending.taskId} 已经用 /dsh-auto-dev adopt 转到这个会话（来自 ${pending.from ?? '另一个会话'}）。`, `dsh-auto-dev ${pending.kind}`)] }
     }
     // A task waiting at the review step is not "active" any more, but it is still
     // the task this conversation is about — so the step has to see it.
@@ -230,21 +223,13 @@ export function registerHooks(ctx, api) {
     // 收案：打完了不等于收案。有人能看的东西就停在这儿，等人一句话。
     if (task && task.state === 'review_ready') {
       const said = personSaid(messages)
-      const verdict = reviewVerdict(said)
       const now = new Date().toISOString()
-      // The person's words are the decision; the state change is the model's
-      // call. Handing the words over instead of writing `closed` here keeps the
-      // ledger honest: a task closes because accept was called, never because a
-      // hook guessed what a sentence meant.
-      if (verdict === 'accepted') {
+      // The person's words go to the model as they are; whether they are a yes is its
+      // reading (插件不干预语义). The state change is the model's call too.
+      if (said !== '') {
         return { ...decision, messages: [...decision.messages, api.notice(
-          `用户看过并说「${said.slice(0, 40)}」：这算同意，收案（accept），告诉他这一版收下了。`,
-          'dsh-auto-dev review accepted')] }
-      }
-      if (verdict === 'revise') {
-        return { ...decision, messages: [...decision.messages, api.notice(
-          `用户看过并提了意见：「${said.slice(0, 200)}」。退回（rework）按他说的改，改完再交。`,
-          'dsh-auto-dev review revise')] }
+          `用户在验收时回了：「${said.slice(0, 200)}」。如果这是同意，收案（accept），告诉他这一版收下了；如果提了意见，退回（rework）按他说的改，改完再交；如果说的是别的事，照他说的做。`,
+          'dsh-auto-dev review reply')] }
       }
       if (said === '' && !task.review?.asked) {
         await api.records.change('tasks', task.id, current => ({
@@ -253,15 +238,14 @@ export function registerHooks(ctx, api) {
         return { ...decision, messages: [...decision.messages, api.notice(...reviewCard(task))] }
       }
     }
-    // An explicit start/new already carries the person's intent, including when
-    // they chose new while older work is unfinished. Teach registration first.
+    // An explicit start/new carries the person's intent but not yet a clear request:
+    // nothing is registered here. The card asks for the request to be made clear first,
+    // and the model registers its restatement once it is (F-clarify 6b).
     const startGrant = api.readStartGrant(agent)
-    if (!task && startGrant.ok && !state.startHinted) {
+    if (!task && startGrant.ok && !state.startHinted && !noticeSaid(agent.session, 'dsh-auto-dev start granted', startGrant.seq)) {
       state.startHinted = true
-      return { ...decision, messages: [...decision.messages, api.notice(
-        startedBrief(startGrant.text, await api.startTask(agent, startGrant.text)),
-        'dsh-auto-dev start granted',
-      )] }
+      await noteStartTree(agent)
+      return { ...decision, messages: [...decision.messages, api.notice(...clarifyCard(startGrant.text, startGrant.auto))] }
     }
     // Before the generic hint, the one that matters more: something is already
     // half done on this project. In the skill generation the state sat in the
@@ -287,7 +271,7 @@ export function registerHooks(ctx, api) {
       state.hinted = true
       state.taskId = undefined
       return { ...decision, messages: [...decision.messages, api.notice(
-        'Auto Dev v3 在这个 profile 里只由用户手动启动：用户会用 /dsh-auto-dev start <他的原话> 开一个任务。你不要自己开任务；如果你判断这是一件需要跟踪的交付工作，用一句话问用户「要不要我用 auto-dev 跟一下」，等他同意。看一眼代码、问个问题都不需要任何登记。',
+        '这里的任务只由用户手动启动：用户会用 /dsh-auto-dev start <他的原话> 开一个任务。你不要自己开任务；如果你判断这是一件需要跟踪的交付工作，用一句话问用户「要不要我用 auto-dev 跟一下」，等他同意。看一眼代码、问个问题都不需要任何登记。',
         'dsh-auto-dev standing hint',
       )] }
     }
@@ -312,7 +296,7 @@ export function registerHooks(ctx, api) {
       if (!parked && step - narratedAt >= narrationLimit && step - nudgedAt >= narrationLimit) {
         state.narrationNudgedAt = step
         return { ...decision, messages: [...decision.messages, api.notice(
-          `Auto Dev v3：你已经 ${step - narratedAt} 步没有对用户说一句可见的话了。先用一两句向用户交代——现在在做什么、最近的关键结果、有没有卡住——然后再继续干活。工具调用不算对用户说话。`,
+          `你已经 ${step - narratedAt} 步没有对用户说一句可见的话了。先用一两句向用户交代——现在在做什么、最近的关键结果、有没有卡住——然后再继续干活。工具调用不算对用户说话。`,
           'no visible words to the user',
         )] }
       }
@@ -356,6 +340,29 @@ export function registerHooks(ctx, api) {
   // printed once `rm -rf src` has already run is a receipt for damage, and the
   // submit gate refusing it later only means the report is withheld — the work
   // is gone. Denying the call is the difference between a gate and a diary.
+  // The tree when the person said start: what a later fallback compares to, and the
+  // 「开工前」 save the task pins when it is registered. Session memory only; the next
+  // start replaces it, registration spends it (大原则 8).
+  async function noteStartTree(agent) {
+    const state = api.sessionState(agent)
+    state.startTree = undefined
+    const project = api.projectOf(agent)
+    if (typeof project !== 'string' || project === '') return
+    const print = await fingerprint(project)
+    const commit = api.settings().checkpoints === false ? undefined : await startTree(project)
+    if (print || commit) state.startTree = { project, ...(print ? { print } : {}), ...(commit ? { commit } : {}) }
+  }
+
+  // Whether G2 or G3 would act on this call, before any task exists to hold the answer.
+  async function gated(agent, exec) {
+    const args = exec.arguments ?? {}
+    const path = filePathOf(exec)
+    const env = await readEnv(api.projectOf(agent))
+    if ((path && blockedBy(env, [path])?.row) || (typeof args.command === 'string' && blockedCommand(env, args.command)?.row)) return true
+    const risks = risksOfCall(exec, { protectedPrefixes: api.settings().protectedPaths })
+    return risks.destructive.length + risks.production.length > 0
+  }
+
   const RISK_WORDS = { 'recursive-delete': '整个删掉一批文件', 'forced-git-reset': '丢掉没提交的改动', 'force-push': '覆盖或删掉远端的提交', 'history-rewrite': '改写 git 历史', 'sql-destruction': '删掉数据库里的数据', infrastructure: '改动线上基础设施', 'disk-or-package': '对外发布或改动磁盘', deploy: '部署到线上', 'production-write': '改动线上数据', 'remote-shell': '在远端机器上执行', 'control-plane': '改动受保护的文件' }
   ctx.on('tools/pre-execute', async (exec, next) => {
     const agent = exec.agent
@@ -364,13 +371,20 @@ export function registerHooks(ctx, api) {
     // no business being refused in Auto Dev's name.
     if (!api.optedIn(agent)) return next()
     if (v2OwnsSession(agent)) return next()
-    // With no task there is nobody to record an authorization for; the
-    // post-execute hook enrols the write instead of nagging mid-call.
+    // Before registration the gates still hold: a call G2/G3 would stop registers the person's
+    // start first, so the gate has a task to ask for. Every other call is registered after it
+    // ran, by the disk (post-execute) — not by which tool it was. With no start either, there is
+    // nobody to record an authorization for.
+    const startGrant = api.activeTask(agent) ? undefined : api.readStartGrant(agent)
+    if (startGrant?.ok && await gated(agent, exec)) {
+      const started = await api.startTask(agent, startGrant.text, { registeredBy: 'plugin' })
+      if (started?.taskId) api.queueNotice(agent, startedBrief(startGrant.text, started), 'dsh-auto-dev start fallback')
+    }
     const task = api.activeTask(agent)
     if (!task) return next()
     // The tree before the task's first call in this process: what 删除 and 收尾 compare to.
-    const startPrint = await markStart(task.project, task.id)
-    if (!task.trail?.start) await noteTrail(api.records, task.id, () => ({ start: storedPrint(startPrint) }))
+    const startPrint = await markStart(task.project, task.id, undefined, task.trail?.start)
+    if (!task.trail?.start) await noteTrail(api.records, task.id, () => ({ start: storedPrint(startPrint, { incidentsAt: marksOf(task.id).incidentsAt }) }))
     // What this project said never to touch (G3): the path a file tool names, or a
     // command the person wrote, word for word at the start of a simple command.
     // Shell writes into a blocked path are seen on disk at hand-in.
@@ -379,12 +393,18 @@ export function registerHooks(ctx, api) {
     const env = await readEnv(task.project)
     const hit = (path && blockedBy(env, [path])?.row) || (typeof args.command === 'string' && blockedCommand(env, args.command)?.row)
     if (hit) {
+      const rule = `${hit.key && !String(hit.value).includes(hit.key) ? `${hit.key}：` : ''}${hit.value}`
+      // A person at hand decides on the host's own yes/no card, this call only.
+      if (!task.auto && api.hostAsks(agent)) return { kind: 'ask', reason: `dsh-auto-dev ${GATES.G3}: ${rule}`,
+        displayReason: { en: `You ruled out: ${rule}. Allow this one call?`, zh: `你定过「${rule}」，这一步要动它。允许这一次吗？` } }
       api.blockedOnce(agent, `env:${task.id}:${hit.key}`,
         { title: '拦下 · 环境禁令', line: `${hit.value} — 改走禁区外` })
       return {
         kind: 'deny',
         // G3: one rule, one way through.
-        reason: `dsh-auto-dev ${GATES.G3}：用户定过「${hit.key && !String(hit.value).includes(hit.key) ? `${hit.key}：` : ''}${hit.value}」${hit.note ? `（${hit.note}）` : ''}。\n过关：改走禁区外；真要动它，先问用户要不要解除这条。`,
+        reason: `dsh-auto-dev ${GATES.G3}：用户定过「${rule}」${hit.note ? `（${hit.note}）` : ''}。\n过关：${task.auto
+          ? '自动驾驶开着，不替用户解除他定的规则：改走禁区外，交付时把这一步列为「等你决定」。'
+          : `改走禁区外；真要动它，${CONSENT_ASK}要不要解除这条。`}`,
       }
     }
     const config = api.settings()
@@ -392,21 +412,26 @@ export function registerHooks(ctx, api) {
     const raised = risks.destructive.concat(risks.production)
     if (!raised.length) return next()
     const action = args.command ?? args.cmd ?? args.script ?? JSON.stringify(args)
-    // G2 by sequence: the first one of a kind is stopped and the model asks; the
-    // person's next reply decides — a no keeps it stopped, anything else lets this
-    // kind through for the rest of the task. No quote to copy, no form to fill.
+    // G2 by sequence: the first one of a kind is stopped and the model asks; once the
+    // person has answered, this kind goes through for the rest of the task. Whether the
+    // answer was yes is the model's reading (插件不干预语义). No quote to copy, no form to fill.
+    const shown = String(action).split(/;|&&|\|\|/)[0].trim().slice(0, 48)
+    const effect = RISK_WORDS[raised[0]] ?? '造成不可逆的改动'
+    // A person at hand decides on the host's own yes/no card; what comes back to the model
+    // (run, or 「the user rejected」) needs no reading.
+    if (!task.auto && api.hostAsks(agent)) return { kind: 'ask', reason: `dsh-auto-dev ${GATES.G2}: ${String(action).slice(0, 160)}`,
+      displayReason: { en: `This cannot be undone: ${shown}. Run it?`, zh: `这一步跑了就回不来（会${effect}）：${shown}。要跑吗？` } }
     const state = api.sessionState(agent)
-    const asked = raised.map(risk => ({ risk, ...consent(state, agent, task, `risk:${risk}`, api.seq(agent)) })).find(row => !row.granted)
+    const asked = task.auto ? { risk: raised[0] } : raised.map(risk => ({ risk, ...consent(state, agent, task, `risk:${risk}`, api.seq(agent)) })).find(row => !row.granted)
     if (!asked) return next()
     api.denied.add(exec.callId)
-    const shown = String(action).split(/;|&&|\|\|/)[0].trim().slice(0, 48)
     api.blockedOnce(agent, `irreversible:${task.id}:${asked.risk}`,
-      { title: '拦下 · 不可逆操作', line: asked.refused ? `${shown} — 你说了不，换个做法` : `${shown} — 先问你再跑` })
+      { title: '拦下 · 不可逆操作', line: task.auto ? `${shown} — 自动驾驶不替你做，留给你决定` : `${shown} — 先问你再跑` })
     return {
       kind: 'deny',
-      reason: asked.refused
-        ? `dsh-auto-dev ${GATES.G2}：用户没同意（「${asked.refused.slice(0, 60)}」）。\n过关：换一个可逆的做法。`
-        : `dsh-auto-dev ${GATES.G2}：\`${String(action).slice(0, 160)}\` 跑了就回不来。\n过关：先问用户「要跑这个吗？会${RISK_WORDS[asked.risk] ?? '造成不可逆的改动'}」，他回了同意再跑。`,
+      reason: `dsh-auto-dev ${GATES.G2}：\`${String(action).slice(0, 160)}\` 跑了就回不来（会${effect}）。\n过关：${task.auto
+        ? '自动驾驶开着，用户不在：这一步不做，换一个可逆的做法继续，交付时把它列为「等你决定」。'
+        : `${CONSENT_ASK}；他选「同意」再跑，选「不同意」就换一个可逆的做法、别再跑这条。`}`,
     }
   })
 
@@ -434,10 +459,28 @@ export function registerHooks(ctx, api) {
     if (v2OwnsSession(agent)) return downstream
     const args = exec.arguments ?? {}
     const command = typeof args.command === 'string' ? args.command : undefined
+    // A file the tool wrote is looked at on disk from now on, even where git does not look.
+    const writtenPath = filePathOf({ name, arguments: args })
+    if (writtenPath && !result?.isError) noteTouched(api.activeTask(agent)?.project ?? api.sessionState(agent).startTree?.project ?? api.projectOf(agent), writtenPath)
+    // The tree moved while the person's start is still unregistered (any tool, shell
+    // included — the disk says so, the command text is not read): register the person's
+    // words now, so the checks, saves and G1/G4 that hang on a task are not skipped.
+    const fallback = []
+    const startState = api.sessionState(agent)
+    // After a restart the start tree is gone: the tree now is the baseline from here on.
+    if (!api.activeTask(agent) && !startState.startTree?.print && api.readStartGrant(agent).ok) await noteStartTree(agent)
+    if (!api.activeTask(agent) && startState.startTree?.print && api.readStartGrant(agent).ok) {
+      const { project, print } = startState.startTree
+      if ((await changedPaths(project, print, await fingerprint(project))).length) {
+        const words = api.readStartGrant(agent).text
+        const started = await api.startTask(agent, words, { registeredBy: 'plugin' })
+        if (started?.taskId) fallback.push(api.notice(startedBrief(words, started), 'dsh-auto-dev start fallback'))
+      }
+    }
     const task = api.activeTask(agent)
     // A write before any task: only a file tool says so with a structured path; shell text is not read.
     const write = Boolean(filePathOf({ name, arguments: args })) && !result?.isError && !api.denied.has(exec.callId)
-    const notices = [...queued]
+    const notices = [...queued, ...fallback]
     // The project's own check, run plainly: a pass marks the tree it covers (G1),
     // and every run is when files gone from disk since the start are looked up.
     if (task && command && exactCheck(command, detectVerifier(task.project))) {
@@ -446,13 +489,15 @@ export function registerHooks(ctx, api) {
         : await markGreen(task.project, task.id, api.seq(agent))
       notices.push(...await deletedNotices(agent, task, now))
     }
-    // The task's first file write: the 「动手前」 sentences, once. Shell writes are not read (宁可漏).
-    // The plugin's own files (.auto-dev/: incidents, domain) are not a change to the project (v36 survey).
-    const own = /(^|[\\/])\.auto-dev[\\/]/.test(String(filePathOf({ name, arguments: args }) ?? ''))
-    if (task && write && !own && task.mode !== 'look' && !api.nudged.has(`first-write:${task.id}`)) {
+    // The task's first change on disk, whichever tool made it (v49 refactor wrote with a heredoc):
+    // the 「动手前」 sentences, once. The fingerprint leaves out the plugin's own .auto-dev/ files.
+    // Once per task, by the log (memory is gone after a restart, v50 test #157).
+    const firstSaid = task && (api.nudged.has(`first-write:${task.id}`) || noticeSaid(agent.session, 'dsh-auto-dev first write', task.openedSeq ?? task.startedSeq ?? 0))
+    const start = task && !firstSaid ? await startOf(task) : undefined
+    if (start && (await fingerprint(task.project))?.id !== start.id) {
       api.nudged.set(`first-write:${task.id}`, true)
-      const spoke = spokeSinceStart(agent, task)
-      notices.push(api.notice(...firstWriteCard(spoke, detectVerifier(task.project), task.request)))
+      const unasked = task.registeredBy === 'plugin' && !spokeSinceStart(agent, task)
+      notices.push(api.notice(...firstWriteCard(unasked, detectVerifier(task.project), task.request)))
     }
     const settingsValue = api.settings()
 
@@ -475,16 +520,15 @@ export function registerHooks(ctx, api) {
           await api.records.change('tasks', id, () => record)
           api.sessionState(agent).taskId = id
           notices.push(api.notice(
-            'Auto Dev v3：这个会话还没开任务就改了文件，已经记成一条「未登记任务」。如果这是正式交付，请用户用 /dsh-auto-dev start <他的原话> 开任务；只是随手看一眼就忽略这条。',
+            '这个会话还没开任务就改了文件，已经记成一条「未登记任务」。如果这是正式交付，请用户用 /dsh-auto-dev start <他的原话> 开任务；只是随手看一眼就忽略这条。',
             'unregistered write enrolled',
           ))
         }
-      } else if (!api.nudged.has(`start-hint:${agent.id}`)) {
+      } else if (!api.nudged.has(`start-hint:${agent.id}`) && !api.readStartGrant(agent).ok && !api.readStartGrant(agent).spent && !api.latestTask(agent)) {
+        // A session that already had a task (closed, handed in, adopted) is not one that never registered.
         api.nudged.set(`start-hint:${agent.id}`, true)
-        const startGrant = api.readStartGrant(agent)
         notices.push(api.notice(
-          startGrant.ok ? startedBrief(startGrant.text, await api.startTask(agent, startGrant.text)) :
-            'Auto Dev v3：这个会话还没有登记任务就在改文件。如果这是一件要交付的工作，把用户的请求原话交回给用户，让他运行 /dsh-auto-dev start <他的原话>；只是随手改代码就忽略这条。',
+          '这个会话还没有登记任务就在改文件。如果这是一件要交付的工作，把用户的请求原话交回给用户，让他运行 /dsh-auto-dev start <他的原话>；只是随手改代码就忽略这条。',
           'dsh-auto-dev start hint',
         ))
       }
@@ -528,13 +572,16 @@ export function registerHooks(ctx, api) {
   // A turn that ends on a question is waiting on the person, not handing in.
   const settleAtStop = async (agent, turn) => {
     const task = api.activeTask(agent)
-    if (!task || task.state !== 'active' || task.mode === 'look') return null
+    if (!task || task.state !== 'active') return null
     const last = lastAssistant(agent.session, turn)
     const text = String(last?.text ?? '').trim()
     if (!text || last.callNames?.length || /[？?]\s*$/.test(text)) return null
-    const start = marksOf(task.id).start
+    const start = await startOf(task)
     const now = start && await fingerprint(task.project)
     if (!now || now.id === start.id) return null
+    // The model already handed this tree in short of complete (the ledger says so,
+    // the disk has not moved since): that report stands, nothing to settle again.
+    if (marksOf(task.id).submitted?.id === now.id) return null
     const state = api.sessionState(agent)
     if (!(state.craftSeen instanceof Set)) state.craftSeen = new Set()
     const key = `${task.id}:settle:${now.id}`
@@ -565,6 +612,14 @@ export function registerHooks(ctx, api) {
     }
   }
 
+  // Files gone from disk while others still name them, looked up when the turn ends too:
+  // the check-run moment alone missed a deletion the model never followed with the check.
+  const deletedAtStop = async agent => {
+    const task = api.activeTask(agent)
+    if (!task || !(await startOf(task))) return null
+    return (await deletedNotices(agent, task, await fingerprint(task.project)))[0] ?? null
+  }
+
   ctx.on('agent/turn-stopping', async ({ agent, turn, signal }) => {
     try {
       if (signal?.aborted) return
@@ -572,7 +627,7 @@ export function registerHooks(ctx, api) {
       // Only the conversations that asked for Auto Dev, and not the ones v2 owns:
       // a notice about a pseudo call is only worth sending where a task exists.
       if (!api.optedIn(agent) || v2OwnsSession(agent)) return
-      const message = guarded(agent, turn) ?? await settleAtStop(agent, turn)
+      const message = guarded(agent, turn) ?? await deletedAtStop(agent) ?? await settleAtStop(agent, turn)
       if (message) agent.steer(message)
     } catch {
       // A rescue that fails silently is still better than a turn that ends in an

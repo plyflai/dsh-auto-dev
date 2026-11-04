@@ -3,13 +3,13 @@ import { approvedReduction, reconcileDelegation, validateSubmission, windowObser
 import { leafUnits, nextUnit } from '../plan.mjs'
 import { deliveryOnce, reviewCard } from '../craft.mjs'
 import { checkRuns, fixesIn, incidentsChangedAt, INCIDENTS_FILE, redStreak, runCheck, tailOf, trimIncidents } from '../facts.mjs'
-import { changedPaths, fingerprint, markGreen, marksOf } from '../disk.mjs'
+import { changedPaths, fingerprint, markGreen, markSubmitted, marksOf, startOf } from '../disk.mjs'
 import { blockedBy, readEnv } from '../env.mjs'
 import { recordWaiting } from '../task-record.mjs'
 import { GateError } from '../gate.mjs'
 import { noteTrail } from '../trail.mjs'
 import { shareIncidents } from '../team.mjs'
-import { string, strings, claimsSchema, containersOf, childrenOf, DAILY_UNIT } from './shared.mjs'
+import { string, strings, claimsSchema, containersOf, childrenOf, DAILY_UNIT, stepName } from './shared.mjs'
 
 /**
  * G1: the tree being handed in passed the project's check. When the last green
@@ -32,7 +32,7 @@ async function g1(api, task, agent, verifier) {
 }
 
 async function g3(task) {
-  const start = marksOf(task.id).start
+  const start = await startOf(task)
   if (!start) return undefined
   const env = await readEnv(task.project)
   if (!env.blocked?.length) return undefined
@@ -74,7 +74,10 @@ export const workSubmit = api => (
     const plan = api.planOf(task)
     // The unit handed in: the one named (a milestone means its next leaf), else the one in hand.
     // A unit still waiting on others is handed in anyway — the work was done; the order was the plan's guess.
-    const named = plan?.units.find(entry => entry.id === args.unit) ?? plan?.units.find(entry => entry.state === 'active') ?? (plan ? nextUnit(plan) : undefined)
+    // The plugin's own hand-in (turn ended on the model's words) is the whole task: it marks no step
+    // done — which steps are done is the model's to say (v54 handoff: README marked done after 「保持 pending」).
+    const settling = exec.callId === 'dsh-auto-dev-settle'
+    const named = settling ? undefined : plan?.units.find(entry => entry.id === args.unit) ?? plan?.units.find(entry => entry.state === 'active') ?? (plan ? nextUnit(plan) : undefined)
     const unit = named ? api.leafOf(plan, named.id) : undefined
     const window = windowObservations(api.observationsOf(exec.agent), task, unit)
     const verifier = api.detectVerifier(task.project)
@@ -84,7 +87,8 @@ export const workSubmit = api => (
     const refused = line => api.blockedOnce(exec.agent, `submit:${task.id}:${unit?.id ?? ''}`,
       { unit: unit?.id, title: '拦下 · 交付退回', line })
     const runs = checkRuns(window.results, verifier)
-    const handIn = verdict.outcome === 'complete' && task.mode !== 'look'
+    // What the model declared (mode, acceptanceMode) is shown, never what decides a gate (v54 look tasks skipped G1).
+    const handIn = verdict.outcome === 'complete'
     // G3 on disk: a file the person ruled out changed since the task started,
     // whichever tool did it. Paths from two fingerprints, never shell text.
     const banned = handIn ? await g3(task) : undefined
@@ -92,12 +96,25 @@ export const workSubmit = api => (
       refused(`改到了禁区 ${banned.path} — 撤回再交`)
       throw new GateError('G3', `用户定过「${banned.row.value}」，这次改到了 ${banned.path}`, '撤回这处改动（可回存档）；真要动它，先问用户要不要解除这条')
     }
-    const ran = handIn ? await g1(api, task, exec.agent, verifier) : undefined
+    // G1 vouches for a change: with the tree as it was at the start there is nothing to vouch
+    // for (v46–v49: 「定位根因」 marked done, nothing written, refused for a red check).
+    const start = await startOf(task)
+    const nowPrint = start ? await fingerprint(task.project) : undefined
+    const moved = !start || nowPrint?.id !== start.id
+    // Whether the disk moved, when both trees can be read; undefined outside git.
+    const changed = start && nowPrint ? nowPrint.id !== start.id : undefined
+    const ran = handIn && moved ? await g1(api, task, exec.agent, verifier) : undefined
     const red = ran?.red
     if (ran?.green) runs.push(ran.green)
+    // G1 skipped because the plugin's own green already covers this tree: that green is a run too,
+    // or the 红 streak below would say 「还红着」 about a tree the plugin saw pass (v57 clarify #612).
+    const covering = marksOf(task.id).green
+    if (!ran && covering?.print && runs.length && !runs.at(-1).ok && nowPrint?.id === covering.print.id) {
+      runs.push({ seq: covering.seq, callId: 'plugin:green', time: Date.now(), command: verifier?.command?.trim() ?? '', ok: true, output: '' })
+    }
     if (red !== undefined) {
       refused(`交付前插件跑了 ${verifier.command}，没通过 — 修好再交`)
-      throw new GateError('G1', `交付前插件在项目里跑了 \`${verifier.command}\`，没通过。输出末尾：\n${red}`, '修好让它通过，再交')
+      throw new GateError('G1', `交付前插件在项目里跑了 \`${verifier.command}\`，没通过。输出末尾：\n${red}\n这是插件跑的检查，不是用户的新要求：如果用户同意过留着这条红，停下告诉他，别为过门去改他不让动的地方`, '修好让它通过，再交')
     }
     const fix = handIn ? g4(task, runs) : undefined
     if (fix) {
@@ -126,12 +143,16 @@ export const workSubmit = api => (
     const dropped = plan ? leafUnits(plan.units).filter(row => row.state === 'dropped') : []
     const reduced = row => approvedReduction(task, plan, row)
     const remaining = plan ? leafUnits(plan.units).filter(row => row.id !== unit?.id && row.state !== 'done' && !(row.state === 'dropped' && reduced(row))) : []
-    if (dropped.length) reminders.push(`有范围没做：${dropped.map(row => row.id).join('、')}`)
+    if (dropped.length) reminders.push(`这几步没做：${dropped.map(row => row.goal || stepName(plan.units, row.id)).join('、')}`)
     if (dropped.length) verdict.warnings.push(`dropped scope (not completed): ${dropped.map(row => `${row.id}${reduced(row) ? ' (person approved scope reduction)' : ' (unresolved)'}`).join(', ')}`)
-    const finishing = verdict.outcome === 'complete' && remaining.length === 0
-    const pmJudges = (task.acceptanceMode ?? 'pm') === 'pm'
+    if (settling && remaining.length) reminders.push(`这几步没标完成：${remaining.map(row => row.goal || stepName(plan.units, row.id)).join('、')}`)
+    const finishing = verdict.outcome === 'complete' && (remaining.length === 0 || settling)
+    // Park for the person when there is something to look at (the tree moved since the start), close when
+    // nothing changed on disk — a hard fact, not the model's acceptanceMode (v54 autopilot closed itself).
+    // Outside git there is no tree to read, and the declared acceptance mode stands; autopilot always parks.
+    const pmJudges = task.auto === true || (changed ?? (task.acceptanceMode ?? 'pm') === 'pm')
     const settledState = finishing ? (pmJudges ? 'review_ready' : 'closed') : undefined
-    if (remaining.length && verdict.outcome === 'complete') verdict.warnings.push(`task remains active: ${remaining.map(row => `${row.id} (${row.state ?? 'pending'})`).join(', ')}; blocked, dropped and unmet dependencies are not completed work`)
+    if (remaining.length && verdict.outcome === 'complete' && !settling) verdict.warnings.push(`task remains active: ${remaining.map(row => `${row.id} (${row.state ?? 'pending'})`).join(', ')}; blocked, dropped and unmet dependencies are not completed work`)
     // Reds of the project's own check since its last pass: exit codes, nothing read.
     const reds = redStreak(runs)
     if (reds.length) reminders.push(`${reds[0].command} 还红着（连续 ${reds.length} 次）`)
@@ -153,6 +174,8 @@ export const workSubmit = api => (
       ...(settledState ? { state: settledState } : {}),
       ...(settledState === 'review_ready' ? { review: { at: now, atSeq: api.seq(exec.agent), asked: false } } : {}),
     }))
+    // Short of complete: the tree this report covers, so a turn that just ends on it is not handed in again (G1).
+    if (verdict.outcome !== 'complete') await markSubmitted(task.project, task.id)
     let updatedPlan
     if (plan && unit) {
       updatedPlan = await api.records.change('plans', plan.id, current => ({
@@ -165,6 +188,7 @@ export const workSubmit = api => (
     }
     // The last child of a theme just landed: that is the moment the theme is
     // over, and it is worth one line rather than being derived silently.
+    const seals = []
     if (verdict.outcome === 'complete' && unit && updatedPlan) {
       for (const theme of containersOf(updatedPlan.units ?? [])) {
         // 日需是桶，不是主题：它永远不收束，也不该在收口时说"全部完成"。
@@ -173,32 +197,32 @@ export const workSubmit = api => (
         const before = childrenOf(plan?.units ?? [], theme.id)
         if (!kids.length || !kids.every(kid => kid.state === 'done')) continue
         if (before.length && before.every(kid => kid.state === 'done')) continue
-        api.queueNotice(exec.agent,
-          `**主题完成 · ${theme.goal}** — ${kids.length} 个单元全部完成`,
+        seals.push([
+          `**主题完成 · ${theme.goal}** — ${kids.length} 步全部完成`,
           `dsh-auto-dev theme ${theme.id} sealed`,
-          { form: 'theme-seal', data: { unit: theme.id, label: theme.goal, line: `${kids.length} 个单元全部完成`, tag: '已收', tone: 'neutral' } })
+          { form: 'theme-seal', data: { unit: theme.id, label: theme.goal, line: `${kids.length} 步全部完成`, tag: '已收', tone: 'neutral' } }])
       }
     }
     api.nudged.delete(`${task.id}:${unit?.id ?? ''}`)
     // A settlement is a progress record too: the unit's note clock restarts.
     api.sessionState(exec.agent).unitNoteSeq = api.seq(exec.agent)
     const promised = typeof unit?.deliverable === 'string' && unit.deliverable.trim() !== '' ? unit : undefined
-    const after = task.mode === 'look'
-      ? { snapshot: 'skipped', reason: 'look does not write' }
-      : promised
-        // A unit that promised something closes with the submission that proves
-        // it: the pair is what a person asked to keep, so it is not part of the
-        // rotating background.
-        ? await api.snapshot(api.records.get('tasks', task.id), 'after', {
-          unit: promised.id, label: promised.deliverable.trim(),
-          outcome: verdict.outcome === 'complete' ? 'done' : 'blocked',
-        })
-        : await api.snapshot(api.records.get('tasks', task.id), 'after', { auto: true })
+    const after = promised
+      // A unit that promised something closes with the submission that proves
+      // it: the pair is what a person asked to keep, so it is not part of the
+      // rotating background.
+      ? await api.snapshot(api.records.get('tasks', task.id), 'after', {
+        unit: promised.id, label: promised.deliverable.trim(),
+        outcome: verdict.outcome === 'complete' ? 'done' : 'blocked',
+      })
+      : await api.snapshot(api.records.get('tasks', task.id), 'after', { auto: true })
     // One line per submission, and the closing one is about the task, not the
     // unit: the last unit is not more interesting than the thing it finished.
     // Hand-in is one of the moments the plugin speaks: the conditional sentences as a capsule, once per task.
     const delivery = finishing ? await deliveryOnce(api, exec.agent, task) : undefined
     if (delivery) api.queueNotice(exec.agent, ...delivery)
+    // The step's own card first, then the theme it closed (v57: 「主题完成」 came before its last step).
+    const sealAfter = () => { for (const seal of seals) api.queueNotice(exec.agent, ...seal) }
     if (verdict.outcome === 'complete') {
       const currentPlan = api.planOf(api.records.get('tasks', task.id))
       const following = currentPlan ? nextUnit(currentPlan) : undefined
@@ -207,14 +231,17 @@ export const workSubmit = api => (
       const parked = api.records.get('tasks', task.id)?.state === 'review_ready'
       const closing = settledState === 'closed'
       const name = typeof task.goal === 'string' && task.goal.trim() !== '' ? task.goal.trim() : String(task.request ?? '').slice(0, 18)
-      if (!parked || unit) {
+      // A unit already done (handed in, then marked done again) gets no second card.
+      if ((!parked || unit) && !(unit && unit.state === 'done')) {
         api.queueNotice(exec.agent,
-          closing ? `**任务完成 · ${name}** — ${verdict.summary}` : `**${unit?.id ?? '这一步'} 完成** — ${verdict.summary}`,
+          closing ? `**任务完成 · ${name}** — ${verdict.summary}` : `**${unit?.id ?? '这一步'} 完成** — ${unit?.goal ? `${unit.goal}：` : ''}${verdict.summary}`,
           closing ? 'dsh-auto-dev task done' : `dsh-auto-dev unit-done ${unit?.id ?? ''}`,
           closing
             ? { form: 'task-done', data: { unit: unit?.id, title: `任务完成 · ${name}`, line: verdict.summary, tag: after?.ref ? `已存档 #${after.seq}` : '已收尾', tone: 'done', ...(reminders.length ? { warnings: reminders } : {}) } }
-            : { form: 'unit-done', data: { unit: unit?.id, title: `${unit?.id ?? '这一步'} 完成`, line: verdict.summary, tag: following ? `下一步 ${following.id}` : parked ? '待验收' : '仍有未完成单元', tone: 'done', ...(reminders.length ? { warnings: reminders } : {}) } })
+            // The card is about this unit: its goal, not a summary that may cover the whole task (v52 #142).
+            : { form: 'unit-done', data: { unit: unit?.id, title: `${unit ? stepName((api.planOf(api.records.get('tasks', task.id)) ?? plan)?.units, unit.id) : '这一步'}完成`, line: unit?.goal || verdict.summary, tag: following ? `下一步：${String(following.goal ?? '').slice(0, 24)}` : parked ? '待验收' : '仍有未完成单元', tone: 'done', ...(reminders.length ? { warnings: reminders } : {}) } })
       }
+      sealAfter()
       // Parked for a person: the review card goes out with the hand-in itself, so a
       // hand-in at turn end (no next step to carry it) still shows it where the turn ended.
       const record = api.records.get('tasks', task.id)
@@ -222,13 +249,16 @@ export const workSubmit = api => (
         await api.records.change('tasks', task.id, current => ({
           ...current, review: { ...(current.review ?? {}), asked: true, askedAt: new Date().toISOString() },
         }))
-        api.queueNotice(exec.agent, ...reviewCard(record))
+        // What is still open rides the review card, the one the person reads when it parks.
+        const [body, summary, extra] = reviewCard(record)
+        api.queueNotice(exec.agent, reminders.length ? `${body}\n${reminders.join('\n')}` : body, summary,
+          reminders.length ? { ...extra, data: { ...extra.data, warnings: reminders } } : extra)
       }
     } else if (promised && ['blocked', 'failed'].includes(verdict.outcome)) {
       api.queueNotice(exec.agent,
         `**${promised.id} 没通过** — ${verdict.summary}`,
         `dsh-auto-dev unit-blocked ${promised.id}`,
-        { form: 'unit-blocked', data: { unit: promised.id, title: `${promised.id} 没通过`, line: verdict.summary, tag: after?.ref ? `已存档 #${after.seq}` : '未存档', tone: 'blocked' } })
+        { form: 'unit-blocked', data: { unit: promised.id, title: `${stepName(plan?.units, promised.id)}没通过`, line: verdict.summary, tag: after?.ref ? `已存档 #${after.seq}` : '未存档', tone: 'blocked' } })
     }
     const refreshed = api.records.get('tasks', task.id)
     const warnings = [...verdict.warnings]

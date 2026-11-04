@@ -2,7 +2,8 @@
  * Everything the plugin says to the model, and when (设计约定「第三条路」).
  *
  * The plugin opens its mouth at moments it can see without understanding:
- *   开工        — START: conditional sentences; whether one applies is the model's call.
+ *   开工命令    — clarifyCard: the person's words and one method, alone (F-clarify 6b).
+ *   登记        — START: conditional sentences; whether one applies is the model's call.
  *   第一次写文件  — FIRST_WRITE: the 「动手前」 sentences, at the moment they are about.
  *   检查第 2 次红 — the fix card: the failing output verbatim and the last incidents.
  *   红后转绿      — the fixed card: write the incident down.
@@ -18,9 +19,11 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { INCIDENTS_FILE, recentIncidents, tailOf, trimmedCheck } from './facts.mjs'
 import { DOMAIN_FILE } from './domain.mjs'
-import { changedPaths, changedSinceStored, fingerprint, marksOf } from './disk.mjs'
+import { changedPaths, changedSinceStored, fingerprint, marksOf, startOf } from './disk.mjs'
 import { spokeSinceStart } from './decisions.mjs'
 import { teamConventions, teamIncidents } from './team.mjs'
+import { noticeSaid } from './said.mjs'
+import { stepName } from './tools/shared.mjs'
 
 /** Said once at start. Each is a condition the model checks against the person's words. */
 export const START = Object.freeze([
@@ -41,7 +44,30 @@ export const FIRST_WRITE = Object.freeze([
 ])
 // A fixed shape for the restatement (v36 clarify: told to stop, the model went on): a
 // format to follow, not a check — whether to restate at all is the model's call.
-const ASK_FIRST = '如果需求有好几条或有含糊处、还没跟用户对过：先停下，对用户复述——第一行写「**我理解的要求：**」，下面逐条列要求和验收；有更省事的做法另起一行「**更省事的做法：**」讲清差别；最后只问一个最影响下一步的问题，然后结束这一回合等他回，别接着改。'
+// Said only when the plugin had to register the task itself at the first write.
+const ASK_FIRST = '如果需求有好几条或有含糊处、还没跟用户对过：先停下，对用户复述——第一行写「**我理解的要求：**」，下面逐条列要求和验收；有更好的做法另起一行讲清差别；最后只问一个最影响下一步的问题，然后结束这一回合等他回，别接着改。'
+
+/** The person flipped the autopilot switch: the model hears what it means for this task, the person sees a capsule. */
+export const autopilotCard = on => [on
+  ? '用户把这个任务的自动驾驶打开了：之后不等用户确认，按你认为的最佳做法往下做；收不回的操作照样不做，换可逆的做法；交付时把没等用户确认就做的决定逐条列出来。'
+  : '用户把这个任务的自动驾驶关了：需求有含糊、有更好的做法、碰到收不回的操作，先问用户再做。',
+'dsh-auto-dev autopilot', { form: 'read-doc', data: { title: `自动驾驶 · ${on ? '开' : '关'}`, line: on ? '不等确认，按最佳做法往下做；收不回的事照样不做' : '有含糊、碰到收不回的事先问你', tag: '开关', tone: 'info' } }]
+
+/**
+ * Said once, the step after `/dsh-auto-dev start`, on its own: nothing is registered
+ * yet, and registering is what this card asks for once the request is clear (v43:
+ * registered at start and told 「直接开工」, the model never asked).
+ */
+export function clarifyCard(words, auto = false) {
+  const method = auto
+    ? '自动驾驶开着：用户不会回话。先只读看代码，登记前不改不删；用更专业的话复述成要求和验收，写清你怎么理解、选了哪个做法和为什么，直接登记开工；有含糊或有更好的做法，按你判断的最佳做法走，交付时把这些决定列出来让用户确认。'
+    : '先弄清要什么再动手：登记前只读，不改不删；需求清楚，就用更专业的话复述成要求和验收，登记后开工；'
+      + '有含糊处，先把复述发给用户确认（第一行写「**我理解的要求：**」，逐条列要求和验收），只问一个最影响下一步的问题，然后结束这一回合等他回。'
+      + '定下来后看一眼相关部分：有明显更好的做法，先讲清差别问他用不用；他说用，就把新做法登记成要求。'
+  return [`用户用 /dsh-auto-dev start 说了要做的事，原话逐字：「${words}」\n${method}`,
+    'dsh-auto-dev start granted', { form: 'read-doc', data: { title: '先理需求', line: oneLine(words), tag: auto ? '自动驾驶' : '开工', tone: 'info' } }]
+}
+const oneLine = words => { const one = String(words ?? '').replace(/\s+/g, ' ').trim(); return one.length > 40 ? `${one.slice(0, 40)}…` : one }
 
 /** The check agreement: the two forms the plugin counts (src/facts.mjs exactCheck), nothing else. */
 const checkAgreement = command => `跑就写 \`${command}\`；要截短输出就写 \`${trimmedCheck(command)}\`（必须带 set -o pipefail，tail 行数随意）。别的写法（不带 pipefail、head、cd、&&）插件不认，出错时就没法帮你排查和存档。`
@@ -58,16 +84,17 @@ export const requestSentences = request => String(request ?? '')
 const SCATTERED = 3
 
 /**
- * The first-write card. `spoke`: the person has said something since the task started (a host fact).
- * `request`: their start words; three or more sentences and no word since go on the card verbatim,
- * so the restatement has the person's own words to work from (v37 clarify: 「没什么含糊的」).
+ * The first-write card. `unasked`: the plugin registered the task at this write (nobody did
+ * before it) and the person has said nothing since the start — host facts both. Then, and only
+ * then, the restatement line, with the start words verbatim when they run to three sentences
+ * or more (v37 clarify: 「没什么含糊的」). A task the model registered was restated already.
  */
-export function firstWriteCard(spoke, verifier, request) {
-  const sentences = spoke ? [] : requestSentences(request)
+export function firstWriteCard(unasked, verifier, request) {
+  const sentences = unasked ? requestSentences(request) : []
   const quoted = sentences.length >= SCATTERED
     ? [`事实：开工原话断开是 ${sentences.length} 句，开工后用户还没说过话——${sentences.slice(0, 8).map(part => `「${part}」`).join('')}`]
     : []
-  const lines = [...quoted, ...(spoke ? [] : [ASK_FIRST]), ...FIRST_WRITE]
+  const lines = [...quoted, ...(unasked ? [ASK_FIRST] : []), ...FIRST_WRITE]
   // The check agreement again, at the moment the next check is about to run (said at start it was not kept, v31).
   const check = verifier?.command ? `\n接下来跑项目检查：${checkAgreement(verifier.command)}` : ''
   return [`**刚改了第一个文件** — 都不适用就忽略：\n${lines.map(line => `- ${line}`).join('\n')}${check}`,
@@ -122,12 +149,19 @@ export const MAX_DOMAIN_LINES = 80
 
 const UNCONFIRMED_LINE = '开工后用户还没说过话：如果需求有好几条或有含糊处，交付时逐条对照原话说你是怎么理解、怎么做的，没做的也说'
 
-export function deliveryLines(paths = [], project, { spoke = true } = {}) {
+const clip = (text, max = 40) => { const one = String(text ?? '').replace(/\s+/g, ' ').trim(); return one.length > max ? `${one.slice(0, max)}…` : one }
+const AUTO_LINE = '自动驾驶开着：把没等用户确认就做的决定（怎么理解需求、选了哪个做法、跳过了哪些要用户点头的操作）逐条列出来，让用户回来一眼能看到'
+
+export function deliveryLines(paths = [], project, { spoke = true, auto = false, open = [] } = {}) {
   let size = 0
   try { size = readFileSync(join(project ?? '', DOMAIN_FILE), 'utf8').split('\n').filter(line => line.trim()).length } catch { /* no domain file */ }
   return [...DELIVERY, ...(paths.some(path => SCREEN.test(String(path))) ? [SCREEN_LINE] : []),
     // Hard fact: the person has not said a word since the start.
     ...(spoke ? [RULE_LINE] : [UNCONFIRMED_LINE]),
+    // Hard fact: the person switched autopilot on for this task.
+    ...(auto ? [AUTO_LINE] : []),
+    // Hard fact: steps the plan still has open. Which of them are done is the model's call (v53 key_reverse: none reported).
+    ...(open.length ? [`计划里还没标完成的步骤：${open.slice(0, 8).map(row => `${row.name}「${clip(row.goal)}」`).join('；')}——如果其中有已经做完的，交付时说出来；没做的说明原因`] : []),
     ...(size > MAX_DOMAIN_LINES ? [`${DOMAIN_FILE} 已经 ${size} 行：如果有重复或过时的口径，合并或删掉，留下现在还成立的`] : [])]
 }
 
@@ -144,12 +178,15 @@ export function deliveryCard(lines) {
  */
 export async function deliveryOnce(api, agent, task) {
   const key = `delivery:${task.id}`
-  if (task.mode === 'look' || api.nudged.has(key)) return undefined
-  const start = marksOf(task.id).start
+  if (api.nudged.has(key) || noticeSaid(agent?.session, 'dsh-auto-dev delivery', task.openedSeq ?? task.startedSeq ?? 0)) return undefined
+  const start = await startOf(task)
   const paths = await changedPaths(task.project, start, start && await fingerprint(task.project))
   if (!paths.length) return undefined
   api.nudged.set(key, true)
-  return deliveryCard(deliveryLines(paths, task.project, { spoke: spokeSinceStart(agent, task) }))
+  const units = api.planOf?.(task)?.units ?? []
+  const open = units.filter(row => !units.some(kid => kid.parent === row.id) && row.id !== 'daily' && !['done', 'dropped'].includes(row.state ?? 'pending'))
+    .map(row => ({ id: row.id, goal: row.goal, name: stepName(units, row.id) }))
+  return deliveryCard(deliveryLines(paths, task.project, { spoke: spokeSinceStart(agent, task), auto: task.auto === true, open }))
 }
 
 export const CARDS = Object.freeze({
@@ -195,6 +232,16 @@ export const fixedCard = (unit, fix) => craftCard('fixed', {
   facts: [`\`${fix.green.command}\` 红了 ${fix.reds.length} 次之后退出码 0`],
 })
 
+/**
+ * Red once, then green: a receipt for the person (修 bug 是一下子修好的，不用走排查). The model
+ * gets one line it need not act on — it already knows; the card is drawn from `data`.
+ */
+export const quickFixCard = (unit, fix) => [
+  '（给用户看的回执：项目检查红一次后转绿。不用回应，照常继续。）',
+  'dsh-auto-dev quick fix',
+  { form: 'read-doc', data: { unit: unit?.id ?? '', title: '一次修通', line: `\`${fix.green.command}\` 红一次后转绿`, tag: '项目检查', tone: 'done' } },
+]
+
 /** Files that vanished from disk while other files still say their name. */
 export const deletedCard = (unit, refs) => craftCard('deleted', {
   unit,
@@ -229,7 +276,8 @@ export async function handoffCard(task, { from } = {}) {
     !changed ? '' : changed.length ? `开工以来改过的文件：${changed.slice(0, 20).join('、')}${changed.length > 20 ? ` 等 ${changed.length} 个` : ''}` : '开工以来项目文件没有变化',
     saves.length ? `存档：${saves.map(row => `${row.label ?? row.tag}（${row.ref}）`).join('、')}` : '',
   ].filter(Boolean)
-  return [`**接手 · ${task.id}** — 从${from ?? '别的会话'}接过来\n${facts.map(line => `事实：${line}`).join('\n')}\n方法：${HANDOFF_LINE}`,
+  const name = clip(task.goal || task.request, 24)
+  return [`**接手 · ${name}** — 从${from ?? '别的会话'}接过来\n${facts.map(line => `事实：${line}`).join('\n')}\n方法：${HANDOFF_LINE}`,
     `dsh-auto-dev handoff ${task.id}`,
-    { form: 'handoff', data: { unit: task.id, title: `接手 · ${task.id}`, line: changed?.length ? `改过 ${changed.length} 个文件${trail.check ? `，最后检查${trail.check.ok ? '通过' : '没过'}` : ''}` : `从${from ?? '别的会话'}接过来`, tag: saves.length ? `${saves.length} 个存档` : '已存档', tone: 'neutral' } }]
+    { form: 'handoff', data: { unit: task.id, title: `接手 · ${name}`, line: changed?.length ? `改过 ${changed.length} 个文件${trail.check ? `，最后检查${trail.check.ok ? '通过' : '没过'}` : ''}` : `从${from ?? '别的会话'}接过来`, tag: saves.length ? `${saves.length} 个存档` : '已存档', tone: 'neutral' } }]
 }

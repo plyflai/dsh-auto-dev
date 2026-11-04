@@ -21,7 +21,8 @@ import { modeLabel } from './mode.mjs'
 
 const h = React.createElement
 
-const laneWord = state => modeLabel(state.mode)
+// What the model declared (look / do) is not shown as a fact about the task (v55: 「只读意图」 on a task that wrote files).
+const laneWord = () => '任务'
 const outcomeWord = outcome => ({ complete: '已达成', partial: '部分完成', blocked: '受阻', failed: '未达成' }[outcome] ?? '进行中')
 
 const EMPTY_NEXT = new Set(['', 'none', '无', 'n/a', 'na', '-'])
@@ -265,7 +266,6 @@ const css = `
 .ad3-tl-unit>.ad3-mark{flex:none;width:12px;text-align:center;color:var(--ad3-caption);font-family:var(--ad3-mono)}
 .ad3-tl-unit[data-state="done"]>.ad3-mark{color:var(--ad3-accent)}
 .ad3-tl-unit-goal{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.ad3-tl-parent{flex:none;font-family:var(--ad3-mono);font-size:10.5px;color:var(--ad3-caption)}
 .ad3-facts{border-top:.5px solid var(--ad3-border);padding-top:16px}
 .ad3-facts>summary{cursor:pointer;list-style:none;color:var(--ad3-muted);font-size:11px;line-height:16px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
 .ad3-facts>summary::-webkit-details-marker{display:none}
@@ -371,8 +371,13 @@ body[data-ds-dark-theme] .ad3{--ad3-tip:#7ea6e8}
    one card on the page. */
 .ad3-pane .ad3-state{height:22px;padding:0 9px;border-radius:999px;background:color-mix(in srgb,currentColor 11%,transparent);font-weight:500}
 .ad3-pane .ad3-goal{font-size:16px;line-height:24px;font-weight:650;letter-spacing:-.01em}
-.ad3-pane .ad3-meta{gap:0;color:var(--ad3-caption);font-size:11.5px}
+.ad3-pane .ad3-meta{gap:0;row-gap:2px;flex-wrap:wrap;color:var(--ad3-caption);font-size:11.5px}
 .ad3-pane .ad3-meta>span+span::before{content:'·';margin:0 8px;color:var(--ad3-border-strong)}
+.ad3-req{display:flex;flex-direction:column;gap:6px;padding:12px 14px 12px 16px;border-radius:12px;background:color-mix(in srgb,var(--ad3-blue) 7%,transparent);box-shadow:inset 3px 0 0 var(--ad3-blue-line)}
+.ad3-req ol,.ad3-req ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;color:var(--ad3-text);font-size:12.5px;line-height:19px}
+.ad3-req li{overflow-wrap:anywhere}
+.ad3-req-miss{display:flex;flex-direction:column;gap:6px;margin-top:4px;padding-top:8px;border-top:.5px solid color-mix(in srgb,var(--ad3-warning) 30%,transparent)}
+.ad3-req-miss li{color:var(--ad3-warning)}
 .ad3-pane .ad3-last{padding:14px 16px;border-radius:12px;background:var(--ad3-surface);box-shadow:0 0 0 .5px var(--ad3-border-strong),0 1px 2px rgba(15,20,25,.04)}
 .ad3-outcome{flex:none;height:20px;padding:0 8px;border-radius:999px;font-size:11px;line-height:20px;font-weight:600;color:var(--ad3-accent);background:color-mix(in srgb,var(--ad3-accent) 12%,transparent)}
 .ad3-outcome[data-outcome=partial]{color:var(--ad3-warning);background:color-mix(in srgb,var(--ad3-warning) 12%,transparent)}
@@ -496,19 +501,19 @@ function Bar({ useProjection, openBoard }) {
         },
       }, h('button', { type: 'button', className: 'ad3-toggle', onClick: openBoard, 'aria-label': '打开 Auto Dev 看板' },
         h(Icon, { name: 'task' }),
-        h('span', { className: 'ad3-brand' }, 'Auto Dev'),
+        h('span', { className: 'ad3-brand' }, state.auto ? 'Auto Dev · 自动驾驶' : 'Auto Dev'),
         h('span', { className: 'ad3-where' }, where || '尚未开始'))),
       h('div', { className: 'ad3-actions' },
         pulse ? h(Tip, {
           detail: {
-            title: `${pulse.unit} · ${elapsedWord(pulse.since)}`,
+            title: `${stepOf(state, pulse.unit)} · ${elapsedWord(pulse.since)}`,
             lines: [
               pulse.check ? `最近一次检查 · ${pulse.check.command} · ${pulse.check.ok ? '通过' : '没通过'}` : '还没跑过检查',
               pulse.check && pulse.check.count > 1 ? `这条命令已经跑了 ${pulse.check.count} 次` : '',
             ],
           },
         }, h('span', { className: 'ad3-pulse', 'data-ok': pulse.check ? String(Boolean(pulse.check.ok)) : undefined },
-          h('b', null, pulse.unit),
+          h('b', null, stepOf(state, pulse.unit)),
           h('span', null, elapsedWord(pulse.since)),
           pulse.check ? h('code', null, pulse.check.command) : null,
           pulse.check ? h('i', null, pulse.check.ok ? '✓' : '✕') : null,
@@ -771,9 +776,26 @@ function packetsOf(units, openOf = () => false, onOpen = () => {}, delegated = n
   }))
 }
 
-function unitList(state, foldOf = () => false, onToggle = () => {}, openOf = () => false, onOpen = () => {}, delegated = new Map(), marks = []) {
+/** 「第 N 步」 or 「<主题> · 第 k 步」: a person never reads a unit id. */
+function stepOf(state, id) {
   const groups = state.milestones ?? []
-  const units = state.units ?? []
+  const units = (state.units ?? []).filter(unit => !groups.some(group => group.id === unit.id))
+  const unit = units.find(row => row.id === id)
+  if (!unit) return '这一步'
+  if (unit.parent && unit.parent !== 'daily') {
+    const group = groups.find(row => row.id === unit.parent)
+    const siblings = units.filter(row => row.parent === unit.parent)
+    return `${group?.label || '这一组'} · 第 ${siblings.indexOf(unit) + 1} 步`
+  }
+  return `第 ${units.filter(row => !row.parent || row.parent === 'daily').indexOf(unit) + 1} 步`
+}
+
+function unitList(state, foldOf = () => false, onToggle = () => {}, openOf = () => false, onOpen = () => {}, delegated = new Map(), marks = []) {
+  // With no real theme the 日需 bucket is just the plan: its steps show flat, not folded into
+  // 「日需 · 小动作」 (v54: a 3-step plan read as one closed card).
+  const themed = (state.milestones ?? []).some(group => group.role !== 'daily')
+  const groups = themed ? state.milestones ?? [] : []
+  const units = themed ? state.units ?? [] : (state.units ?? []).filter(unit => unit.id !== 'daily').map(unit => (unit.parent === 'daily' ? { ...unit, parent: undefined } : unit))
   const byId = new Map(groups.map(group => [group.id, group]))
   const loose = units.filter(unit => !unit.parent && !byId.has(unit.id))
   const ordered = [...groups.filter(group => group.role !== 'daily'), ...groups.filter(group => group.role === 'daily')]
@@ -945,11 +967,11 @@ function Timeline({ rows, openOf, onOpen }) {
           h('span', { className: 'ad3-caret', 'data-open': open ? 'true' : undefined }, '›')),
         open && units.length
           ? h('ul', { className: 'ad3-tl-units' }, units.map(unit => h('li', {
-            key: unit.id, className: 'ad3-tl-unit', 'data-state': unit.state,
+            // A step sits indented under its theme's own row; repeating the theme name squeezed the step's goal out (v58).
+            key: unit.id, className: 'ad3-tl-unit', 'data-state': unit.state, style: unit.parent ? { paddingLeft: 18 } : undefined,
           },
             h('span', { className: 'ad3-mark' }, unitMark(unit.state)),
-            h('span', { className: 'ad3-tl-unit-goal' }, unit.goal),
-            unit.parent ? h('span', { className: 'ad3-tl-parent' }, unit.parent) : null)))
+            h('span', { className: 'ad3-tl-unit-goal' }, unit.goal))))
           : null)
     })))
 }
@@ -985,6 +1007,10 @@ function Board({ useProjection }) {
   // The bucket is drawn, but it is not a campaign: counting it as a theme made
   // "1 个主题" appear on plans that had no theme at all.
   const campaigns = (state.milestones ?? []).filter(group => group.role !== 'daily')
+  // A task with no plan is still one step: the task itself, its state from the record.
+  const steps = state.units?.length ? state.units
+    : state.taskId ? [{ id: 'task', goal: state.goal || state.request || '', state: ['review_ready', 'closed'].includes(state.taskState) ? 'done' : state.taskState === 'active' ? 'active' : 'pending' }]
+      : []
   const milestoneDone = campaigns.filter(group => group.state === 'done').length
   return h('section', { className: 'ad3 ad3-pane', 'aria-label': 'Auto Dev 看板' },
     h('style', null, css),
@@ -1008,22 +1034,28 @@ function Board({ useProjection }) {
         : null,
       h('div', { className: 'ad3-meta' },
         h(Rail, { done, total, pending: 0, label: counting.label }),
+        // The mode the person switched on comes right after the state: a narrow panel wraps, it never hides it.
+        state.auto ? h('span', { className: 'ad3-num', title: '不等你确认，按最佳做法往下做；收不回的事照样留给你' }, '自动驾驶') : null,
         state.project ? h('span', { className: 'ad3-num', title: state.project }, basename(state.project)) : null,
         // Old tasks carry checkpoints written before a checkpoint belonged to a
         // unit; without this line their archives were invisible everywhere.
         (state.checkpoints ?? 0) > 0 ? h('span', { className: 'ad3-num', title: '本任务存过的存档数' }, `存档 ${state.checkpoints}`) : null,
-        state.acceptanceMode
-          ? h('span', { className: 'ad3-num', title: state.acceptanceMode === 'pm' ? '完成后等待你的实际验收' : '完成由项目自己的检查判定' }, state.acceptanceMode === 'pm' ? '由你验收' : '自动收')
-          : null,
         // Reminders read in the last delivery below, in their own words; a count
         // here as well was the same fact twice.
         state.warnings && warningLines(state).length && !state.last ? h('span', { className: 'ad3-num ad3-warn', title: warningLines(state).join('\n') }, warningsLabel(state.warnings)) : null)),
-    h('details', { className: 'ad3-facts' },
-      h('summary', null, `验收条件与未验证项${state.unverified?.length ? ` · ${state.unverified.length} 项` : ''}`),
-      h('div', { className: 'ad3-facts-body' },
-        row('验收条件', state.acceptance?.length ? state.acceptance.join('；') : '未记录验收条件'),
-        row('未验证项', state.unverified?.length ? state.unverified.join('；') : '本次未报告未验证项'))),
-    state.units?.length
+    // The bar for done, as the model understood the request: what the person checks the work against,
+    // so it sits right under the task, open, set apart from body text. Nothing written, no card.
+    state.acceptance?.length || state.unverified?.length
+      ? h('div', { className: 'ad3-req' },
+        h('span', { className: 'ad3-eyebrow' }, '要求'),
+        state.acceptance?.length ? h('ol', null, state.acceptance.map((line, index) => h('li', { key: index }, line))) : null,
+        state.unverified?.length
+          ? h('div', { className: 'ad3-req-miss' },
+            h('span', { className: 'ad3-eyebrow' }, '没做的'),
+            h('ul', null, state.unverified.map((line, index) => h('li', { key: index }, line))))
+          : null)
+      : null,
+    steps.length
       ? h('div', { className: 'ad3-section' },
         h('div', { className: 'ad3-section-head' },
           h('span', { className: 'ad3-eyebrow' }, '分步'),
@@ -1031,10 +1063,10 @@ function Board({ useProjection }) {
             ? h('span', { className: 'ad3-note ad3-inline-note' }, `${campaigns.length} 个主题${milestoneDone ? ` · ${milestoneDone} 已收` : ''}`)
             // No container and a long list: say what the plan is instead of drawing
             // eight peers and letting the reader guess whether that was intended.
-            : (state.units?.length ?? 0) > 5
+            : steps.length > 5
               ? h('span', { className: 'ad3-note ad3-inline-note ad3-ungrouped', title: '这个计划没有分组：如果其中有两条以上独立的验收目标，可以给它们立一个 theme' }, '未分组')
               : null),
-        unitList(state, foldOf, onToggle,
+        unitList({ ...state, units: steps }, foldOf, onToggle,
           id => opened[id] === true,
           id => setOpened(previous => ({ ...previous, [id]: !previous[id] })),
           delegatedUnits(state),
@@ -1043,7 +1075,7 @@ function Board({ useProjection }) {
     last
       ? h('div', { className: 'ad3-last' },
         h('div', { className: 'ad3-last-line' },
-          h('span', { className: 'ad3-eyebrow' }, last.unit ? `最近一次结账 · ${last.unit}` : '最近一次结账（任务级）'),
+          h('span', { className: 'ad3-eyebrow' }, last.unit ? `最近一次交付 · ${stepOf(state, last.unit)}` : '最近一次交付'),
           h('span', { style: { flex: 1 } }),
           h('span', { className: 'ad3-outcome', 'data-outcome': last.outcome ?? '' }, outcomeWord(last.outcome))),
         last.summary ? h('p', { className: 'ad3-summary' }, last.summary) : null,

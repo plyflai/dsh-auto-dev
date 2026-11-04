@@ -77,11 +77,14 @@ export function withDaily(units) {
   const rest = rows.filter(row => row.id !== DAILY_UNIT.id)
   // A row that already holds units is a campaign theme, not a small action: it
   // stays at the top level even though nothing points at it.
-  const containers = new Set(rest.map(row => row.parent).filter(Boolean))
+  // A row that holds steps — named by its children's parent, or still nested as steps/units — is a theme.
+  const nested = row => ['units', 'steps', 'tasks', 'items', 'subtasks'].some(key => Array.isArray(row?.[key]) && row[key].length)
+  const containers = new Set([...rest.map(row => row.parent).filter(Boolean), ...rest.filter(nested).map(row => row.id).filter(Boolean)])
   const orphans = rest.filter(row => !row.parent && !containers.has(row.id))
   if (!held && orphans.length === 0) return rows
   const bucket = { ...DAILY_UNIT, ...(held ?? {}), role: 'daily' }
-  return [bucket, ...rest.map(row => (row.parent ? row : { ...row, parent: DAILY_UNIT.id }))]
+  // Only loose steps go in the bucket; a theme (a row that holds steps) stays at the root (v57 feature).
+  return [bucket, ...rest.map(row => (row.parent || containers.has(row.id) || nested(row) ? row : { ...row, parent: DAILY_UNIT.id }))]
 }
 
 export function dailyWarning(view) {
@@ -115,4 +118,35 @@ export function planUnits(plan) {
   const units = normalizeUnits(plan)
   // done is owned by a verified work_submit; an opening plan that says so starts pending.
   return units.length ? units.map(unit => unit.state === 'done' ? { ...unit, state: 'pending' } : unit) : null
+}
+
+/** What a step is called where a person reads it: its goal, else its position (records from older builds wrote 「单元 <id>」). */
+export function shownGoal(units = [], unit) {
+  const goal = String(unit?.goal ?? '').trim()
+  return goal && !/^单元 \S+$/.test(goal) ? goal : stepName(units, unit?.id)
+}
+
+/**
+ * How a person names a step: 「第 N 步」 in plan order, or 「<主题> · 第 k 步」 inside a theme.
+ * Unit ids are for the model to point with; they never reach the card face or the panel.
+ */
+export function stepName(units = [], id) {
+  const rows = (units ?? []).filter(unit => unit.id !== DAILY_UNIT.id && unit.role !== 'daily')
+  const leaves = rows.filter(unit => !rows.some(other => other.parent === unit.id))
+  const unit = rows.find(row => row.id === id)
+  if (!unit) return '这一步'
+  const parent = unit.parent ? rows.find(row => row.id === unit.parent) : undefined
+  if (parent && parent.id !== DAILY_UNIT.id) {
+    const siblings = leaves.filter(row => row.parent === parent.id)
+    return `${parent.goal} · 第 ${siblings.indexOf(unit) + 1} 步`
+  }
+  const at = leaves.indexOf(unit)
+  return at < 0 ? '这一步' : `第 ${at + 1} 步`
+}
+
+/** A theme's state from its steps: all done is done, any started is active, else what it says. One rule for board and timeline. */
+export function themeState(children = [], own = 'pending') {
+  if (children.length && children.every(child => child.state === 'done')) return 'done'
+  if (children.some(child => child.state === 'active' || child.state === 'done')) return 'active'
+  return own ?? 'pending'
 }

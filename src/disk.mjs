@@ -26,6 +26,26 @@ const MARKS = 200
 const marks = new Map()
 const roots = new Map()
 const OWN = '.auto-dev'
+// Files written where git does not look (ignored outputs, build dirs): a file tool named the
+// path, the stamp is read off disk. Per project, newest TOUCHED kept; a restart forgets them (宁可漏).
+const TOUCHED = 200
+const touched = new Map()
+
+/** A path a file tool wrote: looked at on disk in every fingerprint from now on, ignored or not. */
+export function noteTouched(project, path) {
+  if (typeof project !== 'string' || typeof path !== 'string' || path === '') return
+  let base = project
+  try { base = realpathSync(project) } catch { /* keep the spelling given */ }
+  const absolute = isAbsolute(path) ? path : join(project, path)
+  let real = absolute
+  try { real = realpathSync(absolute) } catch { /* a file not there yet */ }
+  const name = relative(base, real)
+  if (!name || name.startsWith('..') || isAbsolute(name) || name === OWN || name.startsWith(`${OWN}/`)) return
+  const set = touched.get(project) ?? new Set()
+  set.delete(name); set.add(name)
+  while (set.size > TOUCHED) set.delete(set.values().next().value)
+  touched.set(project, set)
+}
 
 async function git(project, args, env) {
   try {
@@ -77,6 +97,19 @@ export async function fingerprint(project) {
       untracked.set(name, `${stat.size}:${stat.mtimeMs}`)
     } catch { /* gone between the listing and the stat */ }
   }
+  // Written but outside git's view (v53 key_reverse: the report went to an ignored outputs/).
+  let projectReal = project
+  try { projectReal = realpathSync(project) } catch { /* keep the spelling given */ }
+  const written = [...(touched.get(project) ?? [])].filter(name => !untracked.has(name))
+  // Tracked files are in the tree already; only what git does not see is stamped here.
+  const tracked = new Set(written.length ? (await git(project, ['ls-files', '-z', '--', ...written], env) ?? '').split('\0') : [])
+  for (const name of written) {
+    if (tracked.has(name)) continue
+    try {
+      const stat = statSync(join(projectReal, name))
+      untracked.set(name, `${stat.size}:${stat.mtimeMs}`)
+    } catch { /* gone since it was written */ }
+  }
   const hash = createHash('sha1').update(tree)
   for (const name of [...untracked.keys()].sort()) hash.update(`\0${name}\0${untracked.get(name)}`)
   return { id: hash.digest('hex'), tree, untracked }
@@ -117,7 +150,8 @@ export async function changedPaths(project, before, after) {
 const STORED_UNTRACKED = 500
 
 /** A fingerprint as plain data for a task record (it outlives the process). */
-export const storedPrint = print => print && {
+export const storedPrint = (print, extra = {}) => print && {
+  ...extra,
   tree: print.tree,
   ...(print.untracked.size <= STORED_UNTRACKED ? { untracked: [...print.untracked] } : {}),
 }
@@ -151,20 +185,53 @@ const markOf = taskId => {
   return marks.get(taskId)
 }
 
-/** The tree when the task first acted in this process. Once per task. */
-export async function markStart(project, taskId) {
+/**
+ * A fingerprint back from its stored form (the task record's trail.start), for a process
+ * that did not see the start (v51: after a restart the tree at the first call stood in
+ * for the start, and every change made before the restart vanished from 交付 / 删除 / 收尾).
+ * Untracked stamps that were not stored are taken from now: those changes are missed (宁可漏).
+ */
+export async function restorePrint(project, stored) {
+  if (typeof stored?.tree !== 'string') return undefined
+  const untracked = Array.isArray(stored.untracked) ? new Map(stored.untracked) : (await fingerprint(project))?.untracked ?? new Map()
+  const hash = createHash('sha1').update(stored.tree)
+  for (const name of [...untracked.keys()].sort()) hash.update(`\0${name}\0${untracked.get(name)}`)
+  return { id: hash.digest('hex'), tree: stored.tree, untracked }
+}
+
+/**
+ * The tree the task started from. Memory is a cache: a process that did not see the
+ * start reads it back from the record (`stored` = trail.start), incidents time included.
+ */
+export async function markStart(project, taskId, print, stored) {
   const mark = markOf(taskId)
   if (!mark.start) {
-    mark.start = await fingerprint(project)
-    mark.incidentsAt = incidentsChangedAt(project)
+    const restored = print ? undefined : await restorePrint(project, stored)
+    mark.start = print ?? restored ?? await fingerprint(project)
+    mark.incidentsAt = restored && typeof stored?.incidentsAt === 'number' ? stored.incidentsAt : incidentsChangedAt(project)
   }
   return mark.start
+}
+
+/** The task's start tree: memory, else the record's trail.start; never a tree made up now. */
+export async function startOf(task) {
+  if (!task?.id) return undefined
+  const mark = marksOf(task.id)
+  if (mark.start) return mark.start
+  return task.trail?.start ? markStart(task.project, task.id, undefined, task.trail.start) : undefined
 }
 
 /** The project's check just passed here: this is the tree it covers. */
 export async function markGreen(project, taskId, seq) {
   const print = await fingerprint(project)
   if (print) markOf(taskId).green = { print, seq }
+  return print
+}
+
+/** The model handed in short of complete here: the tree that hand-in covers. */
+export async function markSubmitted(project, taskId) {
+  const print = await fingerprint(project)
+  if (print) markOf(taskId).submitted = print
   return print
 }
 

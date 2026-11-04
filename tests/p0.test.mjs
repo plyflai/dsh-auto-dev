@@ -6,13 +6,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.js'
 import { stubHost } from '../tools/flow.mjs'
-import { consent, decisionSource, controlTransition } from '../src/decisions.mjs'
+import { CONSENT_NO, CONSENT_YES, consent, decisionSource, controlTransition } from '../src/decisions.mjs'
 import { foldBoard, boardOf } from '../src/projection.mjs'
 import { readEnv } from '../src/env.mjs'
 
 const unit = (id, extra = {}) => ({ id, goal: `交付 ${id}`, scope: ['.'], acceptance: [], ...extra })
 const submit = (id, callId, extra = {}) => ({ ...(id ? { unit: id } : {}), outcome: 'complete', summary: '实际检查已通过', next: '查看结果',
   claims: [{ statement: '项目测试通过', execution: { callId } }], ...extra })
+
+/** The person picks one of the gate's two fixed options on a question card. */
+const pick = (h, label, id = `pick-${h.log.length}`) => {
+  h.log.push({ type: 'tool/call', data: { callId: id, name: 'ask_user_question', arguments: { questions: [{ id: 'gate', question: '要做这一步吗？', options: [{ label: CONSENT_YES }, { label: CONSENT_NO }] }] } } })
+  h.result(id, { answers: [{ id: 'gate', selected: [label] }] })
+}
 
 async function harness({ project = mkdtempSync(join(tmpdir(), 'dsh-p0-')), tables, sessionId = 'p0-session', checkpoints = false } = {}) {
   const host = stubHost({ cwd: project, tables })
@@ -83,6 +89,8 @@ test('P0 U01: a G1 refusal leaves ledger, plan, snapshots and notices unchanged;
   assert.equal(opened.checkpoint.seq, 1)
   await h.tool('work_plan', { operation: 'set', units: [unit('ui', { goal: '界面逻辑测试', ui: 'logic' })] })
   await h.tool('work_plan', { operation: 'activate', unit: 'ui' })
+  // G1 vouches for a change made in the task: the tree has to move after the start.
+  writeFileSync(join(h.project, 'tracked.txt'), 'changed in the task')
   const failed = h.exec('npm test')
   assert.equal(h.log.at(-1).data.message.isError, false)
   assert.match(h.log.at(-1).data.message.content[0].text, /\n\[exit code: 1\]$/)
@@ -119,11 +127,13 @@ test('P0 U01: a G1 refusal leaves ledger, plan, snapshots and notices unchanged;
   const value = await h.tool('work_submit', submit('ui', passed, {
     claims: [{ statement: '项目测试通过', command: 'cd . && npm test', execution: { callId: passed } }],
   }))
-  assert.equal(value.state, 'closed')
+  // Files changed since the start: there is something to look at, so it parks for the person
+  // whatever acceptance mode the model declared.
+  assert.equal(value.state, 'review_ready')
   assert.ok(!value.warnings.some(line => line.includes('浏览器证据')))
   assert.equal(h.task().ledger.length, 1)
   assert.equal(h.plan().units.find(row => row.id === 'ui').state, 'done')
-  assert.equal(h.notices.filter(row => row.source.form === 'task-done').length, 1)
+  assert.equal(h.notices.filter(row => row.source.form === 'review').length, 1)
 })
 
 test('P0 U01: failed browser runs and interrupted runs never satisfy a declared UI tier', () => {
@@ -201,7 +211,9 @@ for (const state of ['pending', 'blocked', 'dropped']) test(`P0 U02: ${state} re
   assert.equal(h.task().state, 'active')
   assert.notEqual(value.state, 'closed')
   const board = await h.tool('work_status', { view: 'board' })
-  assert.ok(board.task.unverified.some(row => row.includes('b')))
+  // A cut unit is a 「没做的」; one still to do shows in the step list, not twice.
+  if (state === 'dropped') assert.ok(board.task.unverified.some(row => row.includes('b')))
+  else assert.ok(board.units.some(row => row.id === 'b' && row.state === state))
   assert.equal(h.notices.some(row => row.source.form === 'task-done'), false)
 })
 
@@ -230,7 +242,7 @@ test('P0 U02: sourced scope reduction is visible, and a unit waiting on a droppe
   }
 })
 
-test('P0 U02/U05: PM acceptance waits for the person’s own reply after the hand-in; a no keeps it open', async () => {
+test('P0 U02/U05: PM acceptance waits for the person’s own reply after the hand-in; whether it is a yes is the model’s reading', async () => {
   const h = await harness()
   await h.start({ acceptanceMode: 'pm' })
   await h.tool('work_plan', { operation: 'set', units: [unit('a')] })
@@ -241,11 +253,6 @@ test('P0 U02/U05: PM acceptance waits for the person’s own reply after the han
   const early = await h.tool('work_control', { operation: 'accept', text: '验收通过' })
   assert.equal(early.unchanged, true)
   assert.match(early.tellUser, /还没回话/)
-  h.say('不能接受，还要修改')
-  const no = await h.tool('work_control', { operation: 'accept' })
-  assert.equal(no.unchanged, true)
-  assert.match(no.tellUser, /不是同意/)
-  assert.equal(h.task().state, 'review_ready')
   h.say('验收通过，这一版收下')
   await h.tool('work_control', { operation: 'accept' })
   assert.equal(h.task().state, 'closed')
@@ -270,7 +277,7 @@ test('P0 U05: human messages drive review in both log shapes; plugin notices are
     const negative = `不接受 ${h.task().id} 的当前结果，要求返工`
     h.say(negative, { wrapped })
     const sourceSeq = h.log.length - 1
-    assert.equal((await h.tool('work_control', { operation: 'accept' })).unchanged, true)
+    // The model read it as a no and sent the work back; the plugin keeps the person's message as the source.
     await h.tool('work_control', { operation: 'rework' })
     assert.equal(h.task().state, 'active')
     assert.equal(h.task().rework.source.seq, sourceSeq)
@@ -289,24 +296,17 @@ test('P0 U05: human messages drive review in both log shapes; plugin notices are
   }
 })
 
-test('P0 U03: a candidate becomes a rule only on the person’s reply after it; a no or a picked no keeps it a candidate', async () => {
+test('P0 U03: a candidate becomes a rule only after the person has replied; whether the reply is a yes is the model’s reading', async () => {
   const h = await harness()
   await h.start()
   await h.tool('work_env', { operation: 'propose', kind: 'blocked', key: 'migrations', value: '不得修改 migrations/' })
   const before = await readEnv(h.project)
   assert.match((await h.tool('work_env', { operation: 'confirm', key: 'migrations' })).tellUser, /问用户一句/)
-  h.say('不要这条')
-  assert.match((await h.tool('work_env', { operation: 'confirm', key: 'migrations' })).tellUser, /没确认/)
   assert.deepEqual(await readEnv(h.project), before)
   h.say('确认 migrations 禁令')
   await h.tool('work_env', { operation: 'confirm', key: 'migrations' })
   assert.equal((await readEnv(h.project)).blocked[0].source.by, 'user')
   await h.tool('work_env', { operation: 'propose', kind: 'fact', key: 'port', value: '8080' })
-  const candidate = await readEnv(h.project)
-  h.log.push({ type: 'tool/call', data: { callId: 'env-no', name: 'ask_user_question', arguments: { questions: [{ question: '采用 port = 8080？', options: ['采用', '不接受候选'] }] } } })
-  h.result('env-no', { answers: [{ answer: '不接受候选' }] })
-  await h.tool('work_env', { operation: 'confirm', key: 'port' })
-  assert.deepEqual(await readEnv(h.project), candidate)
   h.log.push({ type: 'tool/call', data: { callId: 'env-choice', name: 'ask_user_question', arguments: { questions: [{ question: '采用 port = 8080？' }] } } })
   h.result('env-choice', { answers: [{ answer: '采用候选' }] })
   await h.tool('work_env', { operation: 'confirm', key: 'port' })
@@ -328,11 +328,13 @@ test('P0 U03: G3 — a rule the person set holds until the person lifts it; lift
   assert.equal(refused.kind, 'deny')
   assert.match(refused.reason, /用户禁令.*不得修改 migrations\/.*\n过关：/s)
   assert.doesNotMatch(refused.reason, /work_env|work_extend|key=/)
-  // First lift attempt stops and says to ask; a no keeps it; a yes lifts it.
-  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则\n过关：先问用户要不要解除/)
-  h.say('不要撤销')
-  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /用户没同意解除/)
+  // First lift attempt stops and asks with two fixed options; words are not read, the picked option decides.
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), new RegExp(`是用户定的规则\\n过关：用问题卡问用户，只给两个选项「${CONSENT_YES}」「${CONSENT_NO}」`))
   h.say('好，撤销 migrations 禁令')
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则/, '打字回答不算点选')
+  pick(h, CONSENT_NO)
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则/)
+  pick(h, CONSENT_YES)
   await h.tool('work_env', { operation: 'forget', key: 'migrations' })
   assert.equal((await h.pre(action, 'write')).kind, 'continue')
   assert.equal((await h.pre({ path: 'secrets/token.txt', old_string: 'a', new_string: 'b' }, 'edit')).kind, 'deny')
@@ -342,7 +344,7 @@ test('P0 U03: G3 — a rule the person set holds until the person lifts it; lift
   assert.match(h.notices.findLast(row => row.source.form === 'env-forget').source.data.line, /migrations/)
 })
 
-test('P0 U05: G2 by sequence — stopped once, then the person’s reply decides for that kind of action', async () => {
+test('P0 U05: G2 by sequence — stopped once, then the option the person picks decides for that kind of action', async () => {
   const h = await harness()
   await h.start()
   // Only the exact list of irreversible commands; rm -rf is covered by saves and the deleted card.
@@ -350,16 +352,16 @@ test('P0 U05: G2 by sequence — stopped once, then the person’s reply decides
   const action = 'git reset --hard HEAD~1'
   const first = await h.pre({ command: action })
   assert.equal(first.kind, 'deny')
-  assert.match(first.reason, /破坏性操作.*\n过关：先问用户「要跑这个吗？/s)
+  assert.match(first.reason, new RegExp(`破坏性操作.*\\n过关：用问题卡问用户，只给两个选项「${CONSENT_YES}」「${CONSENT_NO}」`, 's'))
   assert.doesNotMatch(first.reason, /work_extend|authorization/)
   // Asked, not answered yet: still stopped.
   assert.equal((await h.pre({ command: action })).kind, 'deny')
-  h.say('不行，别删')
-  const no = await h.pre({ command: action })
-  assert.equal(no.kind, 'deny')
-  assert.match(no.reason, /用户没同意/)
-  // After a no the next reply decides again.
+  // Typed words are not read: only the picked option counts.
   h.say('可以删')
+  assert.equal((await h.pre({ command: action })).kind, 'deny')
+  pick(h, CONSENT_NO)
+  assert.equal((await h.pre({ command: action })).kind, 'deny')
+  pick(h, CONSENT_YES)
   assert.equal((await h.pre({ command: action })).kind, 'continue')
   assert.equal((await h.pre({ command: 'git reset --hard origin/main' })).kind, 'continue')
   // A different kind of irreversible action asks on its own.
@@ -374,8 +376,7 @@ test('P0 U05: an option the person picked is a reply; work_extend never grants, 
   const asked = await h.tool('work_extend', { kind: 'authorization', action, reason: '清理备份' })
   assert.equal(asked.granted, false)
   assert.match(asked.tellUser, /直接问用户/)
-  h.log.push({ type: 'tool/call', data: { callId: 'confirm_cmd', name: 'ask_user_question', arguments: { questions: [{ id: 'confirm_cmd', question: `是否允许执行：${action}`, options: [{ label: '允许执行上述命令（推荐）' }, { label: '不执行' }] }] } } })
-  h.result('confirm_cmd', { answers: [{ id: 'confirm_cmd', selected: ['允许执行上述命令（推荐）'] }] })
+  pick(h, CONSENT_YES, 'confirm_cmd')
   assert.equal((await h.pre({ command: action })).kind, 'continue')
   const source = decisionSource({ agent: h.agent, task: h.task(), after: 0 })
   assert.equal(source.via, 'option-choice')
@@ -388,9 +389,12 @@ test('P0 U05: consent is per task and per kind', () => {
   const state = {}
   assert.equal(consent(state, agent, { id: 't1' }, 'risk:deploy', 0).granted, false)
   log.push({ type: 'user/message', data: { id: 'm', source: { kind: 'user' }, role: 'user', content: [{ type: 'text', text: '发吧' }] } })
-  assert.equal(consent(state, agent, { id: 't1' }, 'risk:deploy', 1).granted, true)
-  assert.equal(consent(state, agent, { id: 't2' }, 'risk:deploy', 1).granted, false)
-  assert.equal(consent(state, agent, { id: 't1' }, 'risk:recursive-delete', 1).granted, false)
+  assert.equal(consent(state, agent, { id: 't1' }, 'risk:deploy', 1).granted, false, '打字回答不算点选')
+  log.push({ type: 'tool/call', data: { callId: 'q', name: 'ask_user_question', arguments: {} } })
+  log.push({ type: 'tool/result', data: { message: { toolCallId: 'q', isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'gate', selected: [CONSENT_YES] }] }) }] } } })
+  assert.equal(consent(state, agent, { id: 't1' }, 'risk:deploy', 3).granted, true)
+  assert.equal(consent(state, agent, { id: 't2' }, 'risk:deploy', 3).granted, false)
+  assert.equal(consent(state, agent, { id: 't1' }, 'risk:recursive-delete', 3).granted, false)
 })
 
 test('P0 U04: only successful tool results change projected business state', () => {

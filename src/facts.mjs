@@ -62,12 +62,17 @@ export const redStreak = runs => {
  * `{ green, reds }` per fix, oldest first. Whether it was a bug is the model's
  * call; the plugin only knows red, red, green.
  */
-export const fixesIn = runs => {
+export const fixesIn = runs => fixes(runs, 2)
+
+/** A passing run right after exactly one failing one: fixed on the first try. */
+export const quickFixesIn = runs => fixes(runs, 1, 1)
+
+const fixes = (runs, min, max = Infinity) => {
   const out = []
   let reds = []
   for (const run of runs) {
     if (!run.ok) { reds.push(run); continue }
-    if (reds.length >= 2) out.push({ green: run, reds })
+    if (reds.length >= min && reds.length <= max) out.push({ green: run, reds })
     reds = []
   }
   return out

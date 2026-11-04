@@ -8,8 +8,16 @@ import { collectObservations } from './session-log.mjs'
 
 const normalize = value => String(value ?? '').replace(/\s+/g, ' ').trim()
 
-/** A reply that says no. Anything else after the model asked is a yes to go on. */
-export const REFUSAL = /(?:不(?:同意|允许|接受|通过|可以|要|行|用了)|不能|不可|别|禁止|拒绝|算了|取消|先不|退回|重做|返工|未通过|not\s+(?:approved|allowed|accepted)|\b(?:no|nope|deny|reject|rework|stop|cancel|don'?t)\b)/i
+
+/** The host hands a question card's answer back as JSON: what the person picked or typed, as they said it. */
+function answerText(text) {
+  let parsed
+  try { parsed = JSON.parse(text) } catch { return text }
+  const said = (Array.isArray(parsed?.answers) ? parsed.answers : [])
+    .flatMap(answer => [...(Array.isArray(answer?.selected) ? answer.selected : []), answer?.custom])
+    .map(value => normalize(typeof value === 'string' ? value : value?.label)).filter(Boolean)
+  return said.length ? said.join('；') : text
+}
 
 /** What the person said after `after`: typed messages and answers to a question card, oldest first. */
 export function repliesAfter(agent, after = -1) {
@@ -24,7 +32,7 @@ export function repliesAfter(agent, after = -1) {
   }
   for (const row of collectObservations(session).results) {
     if (row.seq <= after || !/ask_user_question$/.test(row.name ?? '') || row.isError) continue
-    const text = normalize((row.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n'))
+    const text = answerText(normalize((row.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n')))
     if (text) replies.push({ seq: row.seq, text, via: 'option-choice', callId: row.callId })
   }
   return replies.sort((a, b) => a.seq - b.seq)
@@ -38,19 +46,37 @@ export function decisionSource({ agent, task, after = task?.startedSeq ?? 0, sub
   // Recorded seqs are the session's next seq at the time, so a reply at that seq came after.
   const reply = repliesAfter(agent, after - 1).at(-1)
   if (!reply) return undefined
-  return { sessionId: agent?.session?.id, seq: reply.seq, via: reply.via, quote: reply.text, refused: REFUSAL.test(reply.text),
+  return { sessionId: agent?.session?.id, seq: reply.seq, via: reply.via, quote: reply.text,
     ...(reply.messageId ? { messageId: reply.messageId } : {}), ...(reply.callId ? { callId: reply.callId } : {}),
     ...(task?.id ? { taskId: task.id } : {}), ...(subject ? { subject } : {}) }
 }
 
+/** The two options a hard gate offers when the host has no yes/no card of its own. */
+export const CONSENT_YES = '同意，照做'
+export const CONSENT_NO = '不同意，换做法'
+export const CONSENT_ASK = `用问题卡问用户，只给两个选项「${CONSENT_YES}」「${CONSENT_NO}」`
+
+/** Whether the person picked `label` on a question card after `after`: the option label, compared as is. */
+export function picked(agent, after, label = CONSENT_YES) {
+  for (const row of collectObservations(agent?.session).results) {
+    if (row.seq <= after || !/ask_user_question$/.test(row.name ?? '') || row.isError) continue
+    const text = (row.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('\n')
+    let parsed
+    try { parsed = JSON.parse(text) } catch { continue }
+    const answers = Array.isArray(parsed?.answers) ? parsed.answers : []
+    if (answers.some(answer => Array.isArray(answer?.selected) && answer.selected.includes(label))) return { seq: row.seq, via: 'option-choice', callId: row.callId, quote: label }
+  }
+  return undefined
+}
+
 /**
- * G2 / G3 by sequence. The first attempt is stopped and the model told to ask;
- * once the person has answered after that without refusing, this kind of action
- * is allowed for the rest of the task. Kept in session memory: after a restart
- * the model asks once more, which costs one question and loses nothing.
+ * G2 / G3 by sequence. The first attempt is stopped and the model asks with two fixed
+ * options; the person picking 「同意，照做」 lets this kind of action through for the rest
+ * of the task. The option is the decision — the plugin reads no words (插件不干预语义).
+ * Kept in session memory: after a restart the model asks once more.
  */
 export function consent(state, agent, task, key, seq) {
-  // `seq` is the session's next seq: anything said from it on came after the stop.
+  // `seq` is the session's next seq: anything picked from it on came after the stop.
   const last = seq - 1
   if (!(state.consent instanceof Map)) state.consent = new Map()
   const id = `${task.id}:${key}`
@@ -60,14 +86,10 @@ export function consent(state, agent, task, key, seq) {
     state.consent.set(id, { seq: last })
     return { granted: false }
   }
-  const reply = repliesAfter(agent, asked.seq).at(-1)
-  if (!reply) return { granted: false, waiting: true }
-  if (REFUSAL.test(reply.text)) {
-    asked.seq = last
-    return { granted: false, refused: reply.text }
-  }
-  asked.granted = { seq: reply.seq, via: reply.via, quote: reply.text }
-  return { granted: true, source: asked.granted }
+  const choice = picked(agent, asked.seq)
+  if (!choice) return { granted: false, waiting: true }
+  asked.granted = choice
+  return { granted: true, source: choice }
 }
 
 /** The pause/resume/cancel moves. One that does not apply is answered, not refused. */
@@ -91,7 +113,8 @@ export function controlTransition(state, operation) {
  */
 export function spokeSinceStart(agent, task) {
   const request = String(task?.request ?? '').replace(/\s+/g, ' ').trim()
-  return repliesAfter(agent, task?.startedSeq ?? -1).some(reply => {
+  // From the start command, not the registration: an answer to the clarifying question counts.
+  return repliesAfter(agent, task?.openedSeq ?? task?.startedSeq ?? -1).some(reply => {
     const text = reply.text.replace(/\s+/g, ' ').trim()
     return !/^\/dsh-auto-dev\b/.test(text) && text !== request && !(request && (text.endsWith(request) || request.endsWith(text)))
   })

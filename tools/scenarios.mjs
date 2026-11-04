@@ -14,6 +14,8 @@ import { boardOf, foldBoard, syncState } from '../src/projection.mjs'
 import { execFileSync } from 'node:child_process'
 import '../tests/env.mjs'
 import assert from 'node:assert/strict'
+import { setMarks } from '../src/disk.mjs'
+import { CONSENT_NO, CONSENT_YES } from '../src/decisions.mjs'
 import { inventory, PANEL_KEYS } from './inventory.mjs'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -143,6 +145,19 @@ function helpers(host, state) {
       if (failure) throw failure
       return value
     },
+    // The model registers its restatement once the request is clear (F-clarify 6b). The start brief
+    // arrives in the tool result; it is kept with the hints because that is what the model reads.
+    async register(request) {
+      const value = await this.tool('work_start', { request })
+      hints.push({ summary: 'dsh-auto-dev start brief', text: [value.tellUser, ...(value.brief ?? []), value.envLine ?? ''].filter(Boolean).join('\n') })
+      return value
+    },
+    // The person picks one of a hard gate's two fixed options on a question card.
+    async pick(label) {
+      const callId = `pick-${state.log.length}`
+      state.log.push({ type: 'tool/call', data: { callId, name: 'ask_user_question', arguments: { questions: [{ id: 'gate', question: '要做这一步吗？', options: [{ label: CONSENT_YES }, { label: CONSENT_NO }] }] } } })
+      state.log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'gate', selected: [label] }] }) }] } } })
+    },
     async say(text) {
       const message = { id: `m-${state.log.length}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }
       state.log.push({ type: 'user/message', data: message })
@@ -184,6 +199,8 @@ function helpers(host, state) {
       const callId = `call-${state.run}-write-${state.log.length}`
       const args = { path: join(state.project, path), content }
       state.log.push({ type: 'tool/call', data: { callId, name: 'write', arguments: args } })
+      // The real host runs pre-execute first: that is where an unregistered start is registered.
+      await host.handlers.get('tools/pre-execute')?.({ agent: agent(), callId, name: 'write', arguments: args }, async () => ({ kind: 'continue' }))
       writeFileSync(args.path, content)
       state.log.push({ type: 'tool/result', data: { message: { toolCallId: callId, isError: false, content: [{ type: 'text', text: 'ok' }] } } })
       const downstream = { additionalContexts: [] }
@@ -241,7 +258,7 @@ add('S04', '单元带 kind 只是标签：激活不出关键词卡（第三条�
   ] })
   await h.tool('work_plan', { operation: 'activate', unit: 'b1' })
   await h.tool('work_plan', { operation: 'activate', unit: 'b2' })
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, 'kind 不触发方法卡')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, 'kind 不触发方法卡')
 })
 add('S05', '完成 + 收案 + 看一眼', ['unit-done', 'review'], async h => {
   await h.cmd('start 做一个导出')
@@ -308,10 +325,13 @@ add('S11', '完成任务', ['task-done'], async h => {
   const callId = await h.exec('node -e "console.log(1)"')
   await h.tool('work_submit', { outcome: 'complete', summary: '能导了', next: '收尾', claims: [{ statement: '跑了', execution: { callId } }] })
 })
-add('S12', '换个更省事的做法', ['alternative'], async h => {
+add('S12', '更好的做法在对话里问（F-clarify 6b）：旧的 alternative 调用照收、只记历史，不出卡、不挂等待', [], async h => {
   await h.cmd('start 做一个导出')
   await h.tool('work_start', { request: '做一个导出', mode: 'do', scope: ['.'], acceptance: ['能导出'] })
-  await h.tool('work_control', { operation: 'alternative', text: '先复用现有导出器，只补两种格式' })
+  const told = await h.tool('work_control', { operation: 'alternative', text: '先复用现有导出器，只补两种格式' })
+  assert.equal(told.waiting, null)
+  assert.equal(h.receipts.some(row => row.form === 'alternative'), false)
+  assert.equal(Object.values(h.host.tables.tasks)[0].alternatives.length, 1)
 })
 add('S15', '收案（人看了一眼说可以）', ['review-done'], async h => {
   await h.cmd('start 做一个导出')
@@ -508,7 +528,7 @@ add('S26', '任务生命周期：暂停/继续/目标/回执/澄清/假设/复�
   for (const receipt of other.receipts) h.receipts.push(receipt)
 })
 
-add('S27', '存档与回滚：G2 先拦一次，用户回话后才回滚', [], async h => {
+add('S27', '存档与回滚：G2 先拦一次，用户点「同意」才回滚（打字不算）', [], async h => {
   await h.cmd('start 改一个文件')
   // 先把工作树弄脏：`git stash create` 只收已跟踪文件的改动，干净树什么都没有。
   writeFileSync(join(h.state.project, 'README.md'), '# first change\n')
@@ -517,8 +537,10 @@ add('S27', '存档与回滚：G2 先拦一次，用户回话后才回滚', [], a
   writeFileSync(join(h.state.project, 'README.md'), '# changed\n')
   await h.tool('work_control', { operation: 'checkpoints' })
   // G2：第一次回滚被拦，说清过关办法；用户回了话，同一类操作放行。没有要模型抄的原话。
-  await assert.rejects(h.tool('work_control', { operation: 'rollback', target: 'before' }), /回滚会覆盖还没提交的改动.*\n过关：先问用户/s)
+  await assert.rejects(h.tool('work_control', { operation: 'rollback', target: 'before' }), /回滚会覆盖还没提交的改动.*\n过关：用问题卡问用户，只给两个选项/s)
   await h.say('回吧')
+  await assert.rejects(h.tool('work_control', { operation: 'rollback', target: 'before' }), /回滚会覆盖/, '打字不算点选')
+  await h.pick(CONSENT_YES)
   await h.tool('work_control', { operation: 'rollback', target: 'before' })
 }, { checkpoints: true, git: true })
 
@@ -612,19 +634,75 @@ add('S31', '项目时间线：开新任务不盖掉旧任务，新的在上、�
   if (!Array.isArray(past.units) || past.units.length < 1) throw new Error('旧任务展开后没有单元')
 })
 
-add('S32', '命令即登记：用户原话直接成任务，模型什么都不用填，写文件不再提示开工，看板出现目标', [], async h => {
+add('S32', '开工先理需求（F-clarify 6b）：命令后只出一张「先理需求」卡、不登记；用户回话后模型登记自己的复述，原话与回话原文插件自己存；没登记就写文件，写之前兜底登记', ['read-doc'], async h => {
   const request = '把登录按钮改成进度条'
   await h.cmd(`start ${request}`, { deliverFollowup: true })
   const granted = h.hints.find(hint => hint.summary === 'dsh-auto-dev start granted')
-  if (!granted?.text.includes('已经登记好') || !granted.text.includes(request)) throw new Error('命令后的真实 pre-step 没有按原话直接登记任务')
+  if (!granted?.text.includes('先弄清要什么再动手') || !granted.text.includes(request)) throw new Error('命令后没有出「先理需求」卡')
+  if (/直接开工|已经登记/.test(granted.text)) throw new Error('开工卡还在说已登记、直接开工')
   if (/work_start|scope|acceptance/.test(granted.text)) throw new Error('开工提示还在教模型调用登记、填参数')
+  if (!h.receipts.some(row => row.form === 'read-doc' && row.title === '先理需求')) throw new Error('「先理需求」不是胶囊')
   if (h.hints.some(hint => /standing hint|resume hint/.test(hint.summary))) throw new Error('有效授权被未开工或续接提示覆盖')
-  await h.exec('printf draft > draft.txt')
-  if (h.hints.some(hint => hint.summary === 'dsh-auto-dev start hint')) throw new Error('已登记还在提示开工')
-  if (Object.keys(h.host.tables.tasks).length !== 1) throw new Error('一次 start 应恰好一条任务')
+  if (Object.keys(h.host.tables.tasks ?? {}).length !== 0) throw new Error('开工那一刻不该登记')
+  // 模型复述、问一个问题，回合结束；用户回话；模型登记自己的复述。
+  await h.say('只改首页那个')
+  await h.step()
+  if (h.hints.filter(hint => hint.summary === 'dsh-auto-dev start granted').length !== 1) throw new Error('「先理需求」只说一次')
+  const opened = await h.tool('work_start', { request: '首页登录按钮：点下后显示进度条，登录返回后消失' })
+  const task = h.host.tables.tasks[opened.taskId]
+  assert.equal(task.request, request)
+  assert.equal(task.goal, '首页登录按钮：点下后显示进度条，登录返回后消失')
+  assert.deepEqual(task.replies.map(reply => reply.text), ['只改首页那个'])
   const board = await h.board()
   if (board.task?.request !== request) throw new Error('看板缺少命令中的原始目标')
   if (board.timeline?.length !== 1 || !board.timeline[0].current) throw new Error('登记后看板仍为空')
+  // 登记过的任务第一次写文件：不再带复述句（复述过了）。
+  await h.write('a.js', 'export const a = 1\n')
+  const first = h.hints.find(hint => hint.summary === 'dsh-auto-dev first write')
+  assert.doesNotMatch(first.text, /复述/)
+}, { git: true })
+
+add('S70', '兜底登记（F-clarify 6b）：开工后没登记就用文件工具写 → 写之前按用户原话登记、开工前档在写之前；首写卡带复述句；有授权不提示开工', ['read-doc'], async h => {
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  await h.write('a.js', 'export const a = 2\n')
+  const fallback = h.hints.find(hint => hint.summary === 'dsh-auto-dev start fallback')
+  assert.match(fallback?.text ?? '', /改文件前还没登记，已按用户原话登记/)
+  const auto = Object.values(h.host.tables.tasks)[0]
+  assert.equal(auto.request, '给 a.js 加一个导出')
+  assert.equal(auto.registeredBy, 'plugin')
+  assert.match(h.hints.find(hint => hint.summary === 'dsh-auto-dev first write')?.text ?? '', /先停下，对用户复述/)
+  if (h.hints.some(hint => hint.summary === 'dsh-auto-dev start hint')) throw new Error('有授权还在提示开工')
+}, { git: true })
+
+add('S71', '兜底登记看磁盘（F-clarify 6b 第 2 轮）：开工后只读不登记；没登记就用 shell 改了文件 → 树一变就按原话登记，开工前档是开工那一刻的树，登记时的复述补进 goal', ['read-doc', 'notice'], async h => {
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1\n')
+  execFileSync('git', ['add', 'a.js'], { cwd: h.state.project })
+  execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'a'], { cwd: h.state.project })
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1 // 开工前没提交的改动\n')
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  if (JSON.stringify(h.receipts).includes('任务已登记')) throw new Error('开工回执说已登记')
+  assert.match(h.hints.find(hint => hint.summary === 'dsh-auto-dev start granted')?.text ?? '', /登记前只读，不改不删/)
+  await h.exec('cat a.js')
+  if (Object.keys(h.host.tables.tasks ?? {}).length) throw new Error('只读也登记了')
+  await h.exec("echo 'export const b = 2' >> a.js")
+  assert.match(h.hints.find(hint => hint.summary === 'dsh-auto-dev start fallback')?.text ?? '', /已按用户原话登记/)
+  const auto = Object.values(h.host.tables.tasks)[0]
+  assert.equal(auto.registeredBy, 'plugin')
+  const before = auto.checkpoints?.find(point => point.label === '开工前')
+  assert.ok(before, '没有开工前档')
+  assert.equal(execFileSync('git', ['show', `${before.commit}:a.js`], { cwd: h.state.project, encoding: 'utf8' }), 'export const a = 1 // 开工前没提交的改动\n')
+  await h.tool('work_start', { request: '在 a.js 新增导出 b，保留 a' })
+  assert.equal(h.host.tables.tasks[auto.id].goal, '在 a.js 新增导出 b，保留 a')
+}, { checkpoints: true, git: true })
+
+add('S72', '登记不因形状丢授权（v44 feature/hotfix）：work_start 带一个相对的项目名 → 按会话目录解析或忽略，照样登记；登记失败也不把用户的开工用掉', ['read-doc'], async h => {
+  await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  const started = await h.tool('work_start', { request: '在 a.js 新增导出 b', project: 'no-such-dir' })
+  assert.notEqual(started?.started, false, JSON.stringify(started))
+  const task = Object.values(h.host.tables.tasks ?? {})[0]
+  assert.ok(task, '没登记')
+  assert.equal(task.project, h.state.project)
+  if (/nobody has run|由用户自己开/.test(JSON.stringify(h.hints) + JSON.stringify(started))) throw new Error('说用户没开过工')
 })
 
 add('S33', 'P0：G1 由插件交付时自己在项目里跑检查——红就退回不落账（只给人一行「拦下」），吞退出码的写法骗不过，修好后只完成一次', ['unit-open', 'blocked-call', 'task-done'], async h => {
@@ -681,7 +759,9 @@ add('S34', 'P0：写成完成的单元一律回到待做（只有交付能完成
   const board = await h.board()
   assert.equal(board.task.state, 'active')
   assert.deepEqual(board.task.acceptance, ['全部完成'])
-  assert.ok(board.task.unverified.some(text => text.includes('b')))
+  // 阻塞的单元在分步里看得见（不再在「没做的」里重复一遍）。
+  assert.ok(board.units.some(row => row.id === 'b' && row.state === 'blocked'))
+  assert.equal(board.task.unverified.some(text => text.includes('b')), false)
   assert.equal(h.receipts.some(row => ['task-done', 'review'].includes(row.form)), false)
   const done = Object.values(h.host.tables.plans)[0].units.find(row => row.id === 'a')
   const evidenceWindow = done.startedSeq
@@ -709,7 +789,7 @@ add('S34', 'P0：写成完成的单元一律回到待做（只有交付能完成
   assert.ok(settled.task.unverified.some(row => row.includes('b') && row.includes('未完成')))
 })
 
-add('S35', 'P0：环境禁令只凭用户回话确认与撤销（G3 先拦一次），其他禁令保留', ['env'], async h => {
+add('S35', 'P0：环境禁令在用户回话后确认（是不是同意由模型读）；撤销是硬门，用户点「同意」才撤（G3 先拦一次），其他禁令保留', ['env'], async h => {
   await h.cmd('start 检查环境禁令')
   await h.tool('work_start', { request: '检查环境禁令', mode: 'do', scope: ['.'], acceptance: ['禁令来源可查'] })
   for (const key of ['migrations', 'secrets']) {
@@ -717,8 +797,6 @@ add('S35', 'P0：环境禁令只凭用户回话确认与撤销（G3 先拦一次
     if (key === 'migrations') {
       const before = await readEnv(h.state.project), count = h.receipts.length
       assert.match((await h.tool('work_env', { operation: 'confirm', key })).tellUser, /问用户一句/)
-      await h.say('不要这条')
-      assert.match((await h.tool('work_env', { operation: 'confirm', key })).tellUser, /没确认/)
       assert.deepEqual(await readEnv(h.state.project), before)
       assert.equal(h.receipts.slice(count).some(row => row.form === 'env'), false)
     }
@@ -728,10 +806,10 @@ add('S35', 'P0：环境禁令只凭用户回话确认与撤销（G3 先拦一次
   // G3 看文件工具自己的路径参数；命令文本不猜。
   assert.equal((await h.pre('cat migrations/old.sql')).kind, 'continue')
   assert.equal((await h.pre({ path: 'migrations/old.sql', content: 'x' }, 'write')).kind, 'deny')
-  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则\n过关：先问用户/)
-  await h.say('不要撤销 migrations 禁令')
-  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /用户没同意解除/)
-  await h.say('撤销 migrations 禁令')
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则\n过关：用问题卡问用户，只给两个选项/)
+  await h.pick(CONSENT_NO)
+  await assert.rejects(h.tool('work_env', { operation: 'forget', key: 'migrations' }), /是用户定的规则/)
+  await h.pick(CONSENT_YES)
   await h.tool('work_env', { operation: 'forget', key: 'migrations' })
   const receipt = h.receipts.findLast(row => row.form === 'env-forget')
   assert.match(receipt.line, /migrations/)
@@ -752,8 +830,7 @@ add('S36', 'P0：真实验收与重做建立新证据窗口', ['unit-done', 'rev
   await h.tool('work_submit', args)
   assert.equal((await h.tool('work_control', { operation: 'resume' })).unchanged, true)
   await h.say('不通过，需要修改')
-  // 用户说了不：accept 什么都不动，退回才算。
-  assert.equal((await h.tool('work_control', { operation: 'accept' })).unchanged, true)
+  // 是不是同意由模型读；它读成不同意，退回。
   await h.tool('work_control', { operation: 'rework' })
   // 重做之后改了东西：旧的检查不算。检查是红的就退回；插件交付时自己跑，模型引用哪次都一样。
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
@@ -771,7 +848,7 @@ add('S36', 'P0：真实验收与重做建立新证据窗口', ['unit-done', 'rev
   assert.equal((await h.board()).task.state, 'closed')
 })
 
-add('S37', 'P1：统一记录五种信息，真实未决才等待', ['ask', 'alternative', 'postmortem'], async h => {
+add('S37', 'P1：统一记录五种信息，真实未决才等待', ['ask', 'postmortem'], async h => {
   await h.cmd('start 交付探针')
   await h.tool('work_start', { request: '交付探针', mode: 'do', scope: ['.'], acceptance: ['探针可执行'] })
   const long = '说明'.repeat(250)
@@ -789,8 +866,7 @@ add('S37', 'P1：统一记录五种信息，真实未决才等待', ['ask', 'alt
   assert.equal(task.clarify.asked.length, 1)
   assert.equal(task.alternatives.length, 1)
   assert.equal((await h.board()).task.hasReceipt, true)
-  assert.equal((await h.tool('work_control', { operation: 'clarify', answers: [{ q: '输出位置？', answer: '根目录' }] })).waiting, 'user-choice')
-  const resolved = await h.tool('work_control', { operation: 'alternative', text: '复用现有探针', verdict: 'kept' })
+  const resolved = await h.tool('work_control', { operation: 'clarify', answers: [{ q: '输出位置？', answer: '根目录' }] })
   assert.equal(resolved.waiting, null)
   assert.equal(resolved.continueAuthorized, true)
   await h.tool('work_control', { operation: 'goal', text: '旧入口仍可修订目标' })
@@ -901,10 +977,61 @@ const readmeTest = h => {
   writeFileSync(join(h.state.project, 'test', 'readme.test.mjs'), "import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { readFileSync } from 'node:fs'\ntest('readme says fixed', () => assert.match(readFileSync('README.md', 'utf8'), /fixed/))\n")
 }
 
+add('S73', '用户同意留红（v45 test）：模型已交 partial、磁盘没再变 → 回合结束不再自动交付、不跑 G1；计划写成 todo 形状（step/status）照收', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 只加测试，不改 src', { deliverFollowup: true })
+  await h.tool('work_start', { request: '补回归测试，src 不动', plan: [{ step: '写回归测试', status: 'in_progress' }, { step: '跑检查', status: 'pending' }] })
+  const units = (await h.board()).units
+  assert.ok(units.some(row => row.goal === '写回归测试' && row.state === 'active'), JSON.stringify(units))
+  await h.exec('echo "test" > a.test.js')
+  await h.tool('work_submit', { outcome: 'partial', summary: '测试已加，检查按用户同意留红' })
+  await h.stop('测试加好了，npm test 按你同意的留着红。')
+  await h.stop('测试加好了，npm test 按你同意的留着红。')
+  if (h.hints.some(hint => /交付诚实/.test(hint.text))) throw new Error('交了 partial 又在收尾跑 G1')
+})
+
+add('S74', '收案之后不再说「还没登记」（v46 handoff #147）：任务交付关闭后再写文件 → 不出开工提示；问答卡的回话按用户选的字存，不存宿主的 JSON', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.cmd('start 整理一下 list', { deliverFollowup: true })
+  h.state.log.push({ type: 'tool/call', data: { callId: 'q-scope', name: 'ask_user_question', arguments: { questions: [{ id: 'scope', question: '整理到什么程度？' }] } } })
+  h.state.log.push({ type: 'tool/result', data: { message: { toolCallId: 'q-scope', content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'scope', selected: [], custom: '按你推荐的来。' }] }) }] } } })
+  const opened = await h.tool('work_start', { request: 'list 按时间倒序，加 --limit' })
+  assert.deepEqual(h.host.tables.tasks[opened.taskId].replies.map(reply => reply.text), ['按你推荐的来。'])
+  await h.exec('echo "export const a = 1" > a.js')
+  await h.exec('npm test')
+  await h.tool('work_submit', { outcome: 'complete', summary: '好了' })
+  await h.say('收下')
+  await h.tool('work_control', { operation: 'accept', text: '收下' })
+  assert.equal((await h.board()).task.state, 'closed')
+  await h.write('NOTES.md', '# 口径\n')
+  if (h.hints.some(hint => hint.summary === 'dsh-auto-dev start hint')) throw new Error('收案后写文件又说还没登记')
+})
+
+add('S75', '用掉的开工不是没开过工（v47 survey #133）：任务收案后同一会话再登记 → 回执说这次 start 已经登记过哪件，不说 nobody has run', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.cmd('start 看看 list 为什么慢', { deliverFollowup: true })
+  const opened = await h.tool('work_start', { request: '查 list 慢的原因，只看不改' })
+  await h.tool('work_submit', { outcome: 'complete', summary: '结论：每次全量读盘' })
+  // 交付后在等用户看（review_ready）：说已登记过哪件；用户收下关掉之后（survey #109 收案）也一样。
+  let again = await h.tool('work_start', { request: '再开一次' })
+  assert.match(again.tellUser, new RegExp(opened.taskId))
+  h.host.tables.tasks[opened.taskId].state = 'closed'
+  again = await h.tool('work_start', { request: '再开一次' })
+  assert.equal(again.started, false)
+  assert.doesNotMatch(again.tellUser, /nobody has run|由用户自己开/)
+  assert.match(again.tellUser, new RegExp(opened.taskId))
+  await h.write('NOTES.md', '# 口径\n')
+  if (h.hints.some(hint => hint.summary === 'dsh-auto-dev start hint')) throw new Error('用掉开工后写文件又说还没登记')
+})
+
 add('S53', '插件收尾：改完说做完了就是交付，G1 由插件自己跑检查把关；模型不用记得调交付工具', [], async h => {
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
   await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  await h.register('给 a.js 加一个导出')
   // 计划写成 steps 也是计划（v27 写成 steps 被悄悄清空，面板与对话对不上）。
   await h.tool('work_plan', { operation: 'set', steps: [{ id: 'u1', title: '加导出' }] })
   assert.ok((await h.board()).units.some(row => row.id === 'u1' && row.goal === '加导出'))
@@ -948,6 +1075,7 @@ add('S58', '没建计划的小改动：插件收尾交付当场问「要不要�
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
   await h.cmd('start 给 a.js 加一个导出', { deliverFollowup: true })
+  await h.register('给 a.js 加一个导出')
   await h.exec('echo "export const a = 1" > a.js')
   const before = h.receipts.length
   assert.equal((await h.stop('改好了。')).length, 1, '交付条件句先说一次')
@@ -965,7 +1093,7 @@ add('S59', '第一次写文件：「动手前」的条件句此刻出一次（�
   assert.equal(first.length, 1)
   assert.match(first[0].text, /先停下，对用户复述/)
   // 复述的格式是约定，不校验：固定开头、更省事的做法、只问一个、停下（v36 clarify 没停）。
-  assert.match(first[0].text, /「\*\*我理解的要求：\*\*」[\s\S]*「\*\*更省事的做法：\*\*」[\s\S]*只问一个[\s\S]*结束这一回合/)
+  assert.match(first[0].text, /「\*\*我理解的要求：\*\*」[\s\S]*更好的做法[\s\S]*只问一个[\s\S]*结束这一回合/)
   assert.match(first[0].text, /一次只改一处/)
   await h.write('b.js', 'export const b = 1\n')
   assert.equal(h.hints.filter(row => row.summary === 'dsh-auto-dev first write').length, 1, '每个任务只说一次')
@@ -995,20 +1123,236 @@ add('S61', '模型自己调工具交付：交付条件句也是胶囊（不是�
   assert.equal((await h.stop('改好了。')).length, 0, '回合结束不再说第二次')
 }, { git: true })
 
+add('S76', '一次修通（用户 2026-11-04）：原样项目检查红一次就转绿 → 给人一张「一次修通」胶囊，模型那一行只说不用回应；连红两次才走排查（不出这张）；每个任务一次', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
+  await h.exec('npm test')
+  await h.step()
+  assert.equal(h.receipts.filter(row => row.title === '一次修通').length, 0, '红着不说')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec('npm test')
+  await h.step()
+  const quick = h.receipts.filter(row => row.title === '一次修通')
+  assert.equal(quick.length, 1)
+  assert.match(quick[0].line, /`npm test` 红一次后转绿/)
+  assert.match(quick[0].text, /给用户看的回执.*不用回应/)
+  assert.equal(h.receipts.some(row => row.title === '修 bug · 排查'), false)
+  // 再红一次、再绿：同一任务不再说。
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n'); await h.exec('npm test'); await h.step()
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n'); await h.exec('npm test'); await h.step()
+  assert.equal(h.receipts.filter(row => row.title === '一次修通').length, 1, '每个任务一次')
+})
+
+add('S77', '看结果不看动作形状（用户 2026-11-04）：bash 改文件也出「动手前」；没改代码只把调查单元标 done 不跑 G1；同一单元交两次只出一张完成卡；登记前 G2 照拦', [], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1\n')
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  await h.cmd('start 修一下 a 的导出', { deliverFollowup: true })
+  // 登记前：G2 精确词表里的命令照样先问。
+  assert.equal((await h.pre('git reset --hard HEAD~1')).kind, 'deny', '登记前 G2 失效')
+  await h.register('修一下 a 的导出')
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'find', goal: '定位根因' }, { id: 'fix', goal: '修好' }] })
+  // 只读调查，检查还红，把调查单元标完成：磁盘没动，不跑 G1、不打回。
+  await h.exec('npm test')
+  const marked = await h.tool('work_plan', { operation: 'state', unit: 'find', state: 'done', text: '根因在 a.js' })
+  assert.notEqual(marked?.started, false)
+  if (h.receipts.some(row => row.form === 'blocked-call' && /交付/.test(row.title))) throw new Error('没改代码也被 G1 打回')
+  // 同一单元再标一次 done：不再出第二张完成卡。
+  await h.tool('work_plan', { operation: 'state', unit: 'find', state: 'done', text: '根因在 a.js' })
+  assert.equal(h.receipts.filter(row => row.form === 'unit-done' && row.title === '第 1 步完成').length, 1, '同一单元两张完成卡')
+  // 用 bash heredoc 改文件：「动手前」照出。
+  await h.exec("cat > a.js <<'EOF'\nexport const a = 2\nEOF")
+  assert.equal(h.hints.filter(hint => hint.summary === 'dsh-auto-dev first write').length, 1, 'bash 写文件没出动手前')
+}, { git: true })
+
+add('S78', '自动驾驶开关（用户 2026-11-04）：start --auto 开、auto off 关；开着时先理需求不等人、硬门照拦并改走可逆做法、交付列出没等确认的决定；关着且宿主有审批卡时硬门走原生是/否卡', ['read-doc', 'blocked-call'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1\n')
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  await h.cmd('start --auto 整理一下 a 的导出', { deliverFollowup: true })
+  assert.ok(h.receipts.some(row => row.title === '自动驾驶 · 开'), '开关要有胶囊')
+  const clarify = h.hints.find(hint => hint.summary === 'dsh-auto-dev start granted')
+  assert.match(clarify.text, /原话逐字：「整理一下 a 的导出」/)
+  assert.match(clarify.text, /自动驾驶开着：用户不会回话/)
+  assert.doesNotMatch(clarify.text, /结束这一回合等他回/)
+  await h.register('a.js 导出整理成具名导出')
+  assert.equal((await h.board()).task.auto, true)
+  // 硬门照拦，不让模型去问人：换可逆的做法，交付时列出来。
+  const stopped = await h.pre('git reset --hard HEAD~1')
+  assert.equal(stopped.kind, 'deny')
+  assert.match(stopped.reason, /自动驾驶开着，用户不在：这一步不做，换一个可逆的做法继续/)
+  await h.pick(CONSENT_YES)
+  assert.equal((await h.pre('git reset --hard HEAD~1')).kind, 'deny', '自动驾驶下点选也不放行收不回的事')
+  await h.exec("echo 'export const b = 2' >> a.js")
+  await h.exec('npm test')
+  const told = await h.stop('改好了。')
+  assert.match(told[0]?.content?.[0]?.text ?? '', /自动驾驶开着：把没等用户确认就做的决定/)
+  // 关掉之后：宿主有审批服务、会话策略是 ask，硬门走原生是/否卡。
+  await h.cmd('auto off')
+  await h.step()
+  assert.equal((await h.board()).task.auto, false)
+  assert.ok(h.receipts.some(row => row.title === '自动驾驶 · 关'))
+  h.host.ctx.get = name => (name === 'approval' ? { request: async () => 'allowed-once' } : undefined)
+  const ask = await h.pre('git push --force origin main')
+  assert.equal(ask.kind, 'ask')
+  assert.match(ask.displayReason.zh, /跑了就回不来.*要跑吗/)
+  // 会话策略是 never：宿主不会弹卡，退回两个固定选项。
+  h.state.log.push({ type: 'approval/policy', data: { policy: 'never' } })
+  assert.equal((await h.pre('git push --force origin main')).kind, 'deny')
+}, { git: true })
+
+add('S79', '宿主重启（v50 clarify/test）：内存清空后，开工授权从日志里的 start 命令恢复，不说「只由用户手动启动」；「先理需求」「动手前」不重复', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1\n')
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  // 宿主日志里的命令与卡：真宿主写 command/run，插件卡进对话（spliced）。
+  h.state.log.push({ type: 'command/run', data: { name: 'dsh-auto-dev', args: 'start --auto 给 a.js 加一个导出' } })
+  await h.cmd('start --auto 给 a.js 加一个导出', { deliverFollowup: true })
+  const said = summary => ({ type: 'agent/inbox/spliced', data: { inserted: [{ role: 'user', source: { kind: 'dsh-auto-dev', summary }, content: [{ type: 'text', text: '…' }] }] } })
+  h.state.log.push(said('dsh-auto-dev start granted'))
+  // 重启：同一份日志和记录，插件内存全新。
+  const second = await open({ project: h.state.project, sessionId: h.state.sessionId, tables: h.host.tables })
+  second.state.log = h.state.log
+  await second.host.handlers.get('agent/created')?.({ agent: agentFor(second.state) })
+  const r = helpers(second.host, second.state)
+  await r.say('继续')
+  if (r.hints.some(hint => /只由用户手动启动|standing hint/.test(hint.text + hint.summary))) throw new Error('重启后说用户没开过工')
+  if (r.hints.some(hint => hint.summary === 'dsh-auto-dev start granted')) throw new Error('重启后先理需求又说一遍')
+  const opened = await r.tool('work_start', { request: 'a.js 新增导出 b' })
+  assert.ok(opened.taskId, JSON.stringify(opened))
+  assert.equal(r.host.tables.tasks[opened.taskId].auto, true, '自动驾驶从命令原文恢复')
+  await r.exec("echo 'export const b = 2' >> a.js")
+  assert.equal(r.hints.filter(hint => hint.summary === 'dsh-auto-dev first write').length, 1)
+  h.state.log.push(said('dsh-auto-dev first write'))
+  // 再重启一次：「动手前」不再说。
+  setMarks(opened.taskId, {})   // 进程内的开工树也随重启没了
+  const third = await open({ project: h.state.project, sessionId: h.state.sessionId, tables: h.host.tables })
+  third.state.log = h.state.log
+  await third.host.handlers.get('agent/created')?.({ agent: agentFor(third.state) })
+  const t = helpers(third.host, third.state)
+  await t.exec("echo 'export const c = 3' >> a.js")
+  assert.equal(t.hints.filter(hint => hint.summary === 'dsh-auto-dev first write').length, 0, '重启后动手前又说一遍')
+  // 重启前后都改过 a.js：开工树从任务记录还原，交付前对照照出，自动驾驶那句也在（v51 rt-auto 丢了这张）。
+  const told = await t.stop('改好了。')
+  assert.match(told[0]?.content?.[0]?.text ?? '', /交付前对照一下[\s\S]*自动驾驶开着/)
+}, { git: true })
+
+add('S80', '单元完成卡对得上号（v52）：里程碑标 done 关掉它下面所有没完成的叶子、各出一张；卡面写这个单元的目标，不写整件的总结', ['unit-done'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  await h.cmd('start 补测试', { deliverFollowup: true })
+  await h.register('补 rm 的三条测试')
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'u1', goal: '补测试', units: [
+    { id: 'u3', goal: '正常删除' }, { id: 'u4', goal: '删不存在的 id' }, { id: 'u5', goal: '删完再 add' }] }, { id: 'u2', goal: '跑检查' }] })
+  await h.exec("echo 'x' > t.js")
+  await h.exec('npm test')
+  await h.tool('work_plan', { operation: 'state', unit: 'u1', state: 'done', text: '三条测试都加好了，整件做完' })
+  const done = h.receipts.filter(row => row.form === 'unit-done')
+  // 卡面不出编号：主题名 + 第几步。
+  assert.deepEqual(done.map(row => row.title), ['补测试 · 第 1 步完成', '补测试 · 第 2 步完成', '补测试 · 第 3 步完成'])
+  assert.deepEqual(done.map(row => row.line), ['正常删除', '删不存在的 id', '删完再 add'])
+}, { git: true })
+
+add('S81', '产物写进被 git 忽略的目录（v53 key_reverse outputs/）也算改动：动手前照出、收尾交付照走；交付卡列出还没标完成的步骤；卡面不出单元编号', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, '.gitignore'), 'outputs/*\n')
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node -e 0' } }))
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  mkdirSync(join(h.state.project, 'outputs'), { recursive: true })
+  await h.cmd('start 调研输入法内存，出一份报告', { deliverFollowup: true })
+  // 模型自报 look：只是展示用，不决定插件开不开口（v54 两次复现都是 look）。
+  await h.tool('work_start', { request: '调研 iOS 键盘内存并出报告', mode: 'look', acceptanceMode: 'auto', plan: ['静态取证', '检索上限数值', '撰写报告'] })
+  await h.write('outputs/REPORT.md', '# 报告\n')
+  assert.equal(h.hints.filter(hint => hint.summary === 'dsh-auto-dev first write').length, 1, '写进被忽略目录也算第一次改动')
+  // 模型没回报任何一步就说做完了：收尾时插件开口，把没标完成的步骤按名字摆出来。
+  const told = await h.stop('报告已完成，写在 outputs/REPORT.md。')
+  const text = told[0]?.content?.[0]?.text ?? ''
+  assert.match(text, /还没标完成的步骤：第 1 步「静态取证」；第 2 步「检索上限数值」；第 3 步「撰写报告」——如果其中有已经做完的，交付时说出来；没做的说明原因/)
+  assert.doesNotMatch(text, /\bu\d+\b|标成完成/, '不带编号、不教调工具')
+  // 再结束一次：插件代交是任务级的，不替模型把任何一步标成完成；有改动就停在待验收，没标完的步骤写进提醒。
+  await h.stop('报告已完成，写在 outputs/REPORT.md。')
+  const board = await h.board()
+  assert.equal(board.task.state, 'review_ready')
+  assert.deepEqual(board.units.map(row => row.state), ['pending', 'pending', 'pending'])
+  assert.ok(JSON.stringify(h.receipts).includes('这几步没标完成：静态取证、检索上限数值、撰写报告'))
+  for (const row of h.receipts) assert.doesNotMatch(`${row.title} ${row.line} ${row.tag}`, /\bu\d+\b|task-[a-z0-9]+-|\bdaily\b/, `卡面露出编号：${row.title} ${row.line}`)
+}, { git: true })
+
+add('S82', '换步不切断红绿（v56 clarify）：红一次、换一步、再红 → 出排查卡、不出「一次修通」；没写目标的步骤在面板上按位置叫「第 N 步」，不用编号', ['read-doc'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  await h.cmd('start 修 list', { deliverFollowup: true })
+  await h.register('修 list')
+  await h.tool('work_plan', { operation: 'set', units: [{ id: 'u1', steps: [{}, { goal: '补测试' }] }, { id: 'u2', goal: '更新 usage' }] })
+  await h.tool('work_plan', { operation: 'activate', unit: 'u1' })
+  await h.exec('npm test'); await h.step()
+  await h.tool('work_plan', { operation: 'activate', unit: 'u2' })
+  await h.exec('npm test'); await h.step()
+  assert.ok(h.receipts.some(row => row.title === '修 bug · 排查'), '换了一步，第 2 次红照样出排查卡')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec('npm test'); await h.step()
+  assert.equal(h.receipts.some(row => row.title === '一次修通'), false, '红了两次不是一次修通')
+  const status = await h.board()
+  const panel = boardOf(syncState({ ...h.state.log.reduce(foldBoard, null), sessionId: h.state.sessionId },
+    { taskFor: () => ({ task: status.task, plan: { units: Object.values(h.host.tables.plans)[0].units } }) }))
+  const goals = (panel.units ?? []).map(row => row.goal)
+  for (const goal of goals) assert.doesNotMatch(goal, /\bu\d+(\.\d+)?\b|^单元 /, `面板露出编号：${goal}`)
+  assert.ok(goals.includes('补测试') && goals.includes('更新 usage'), JSON.stringify(goals))
+})
+
+add('S83', '主题与 G1 的事实（v57 feature/clarify）：带名字的父项 + 没 id 的 steps → 父项是主题、面板按主题分组、「主题完成」排在最后一步之后；插件 G1 已跑绿的树再交，不说「还红着」', ['theme-seal'], async h => {
+  writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
+  writeFileSync(join(h.state.project, 'a.js'), 'export const a = 1\n')
+  execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
+  await h.cmd('start 加 search', { deliverFollowup: true })
+  await h.register('加 search')
+  await h.tool('work_plan', { operation: 'set', units: [
+    { id: 'search-store', goal: '存储层', steps: [{ goal: '写 search()' }, { goal: '补单测' }] },
+    { id: 'search-cli', goal: '命令行', steps: [{ goal: '接入命令' }] }] })
+  assert.deepEqual(h.receipts.filter(row => row.form === 'theme-open').map(row => row.title || row.line).length, 2)
+  const status = await h.board()
+  const panel = boardOf(syncState({ ...h.state.log.reduce(foldBoard, null), sessionId: h.state.sessionId },
+    { taskFor: () => ({ task: status.task, plan: Object.values(h.host.tables.plans)[0] }) }))
+  assert.deepEqual((panel.milestones ?? []).filter(row => row.role !== 'daily').map(row => row.label), ['存储层', '命令行'], JSON.stringify(panel.milestones))
+  assert.equal(Object.values(h.host.tables.plans)[0].units.find(row => row.id === 'search-store').parent, undefined, '主题不挂进日需')
+  await h.exec("echo 'export const b = 2' >> a.js")
+  await h.tool('work_submit', { unit: 'search-store.1', outcome: 'complete', summary: 'search 写好' }).catch(() => {})
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.tool('work_submit', { unit: 'search-store.1', outcome: 'complete', summary: 'search 写好' })
+  const before = h.receipts.length
+  await h.tool('work_submit', { unit: 'search-store.2', outcome: 'complete', summary: '单测补上' })
+  const forms = h.receipts.slice(before).map(row => row.form)
+  assert.ok(forms.indexOf('unit-done') >= 0 && forms.indexOf('unit-done') < forms.indexOf('theme-seal'), JSON.stringify(forms))
+  // 时间线和看板用同一条推导：步骤都做完的主题，两边都是完成（v58 时间线 ○ 压着 ✓✓）。
+  const timelineUnits = (await h.board()).timeline?.[0]?.units ?? []
+  assert.equal(timelineUnits.find(row => row.id === 'search-store')?.state, 'done', JSON.stringify(timelineUnits))
+  // 红过、插件 G1 已在这棵树上跑绿：再交不该说「还红着」。
+  await h.exec('npm test').catch?.(() => {})
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n'); await h.exec('npm test'); await h.exec('npm test')
+  writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
+  await h.exec("echo 'export const c = 3' >> a.js")
+  await h.tool('work_submit', { unit: 'search-cli.1', outcome: 'complete', summary: '接上了' }).catch(() => {})
+  mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true }); writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## x\n根因：…\n')
+  await h.tool('work_submit', { unit: 'search-cli.1', outcome: 'complete', summary: '接上了' })
+  assert.equal(JSON.stringify(h.receipts.slice(-4)).includes('还红着'), false, '插件自己跑绿过的树不说还红着')
+}, { git: true })
+
 add('S62', '检查的截短写法：带 set -o pipefail 的 tail 照样记红绿；不带 pipefail 的 tail 退出码是 tail 的，不算（v36 模型总接 | tail）', ['read-doc', 'save'], async h => {
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
   await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
   await h.exec('set -o pipefail; npm test 2>&1 | tail -5')
   await h.step()
   // 不带 pipefail：这一次的「绿」是 tail 的，插件不认，不能把红记成绿打断连续红。
   await h.exec('npm test 2>&1 | tail -5')
   await h.step()
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '第 1 次红不说话')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, '第 1 次红不说话')
   await h.exec('set -o pipefail; npm test 2>&1 | tail -20')
   await h.step()
-  const fix = h.receipts.filter(row => row.form === 'read-doc')
+  const fix = h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求')
   assert.equal(fix.length, 1, '约定的截短写法连续第 2 次红出排查卡')
   assert.equal(fix[0].title, '修 bug · 排查')
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
@@ -1021,9 +1365,10 @@ add('S63', 'F-fix：模型红两次后改用组合命令验证、自己没再原
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
   await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
   for (let i = 0; i < 2; i++) { await h.exec('set -o pipefail; npm test 2>&1 | tail -40'); await h.step() }
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').at(-1)?.title, '修 bug · 排查')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').at(-1)?.title, '修 bug · 排查')
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
   await h.exec('cd . && W=$(mktemp -d) && npm test')
   await h.step()
@@ -1049,6 +1394,7 @@ add('S66', 'D2 跨项目：项目 A 交付时复盘原文拷进 ~/.dsh-auto-dev�
   mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
   writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## 旧的一条\n根因：甲\n\n## rm 后 add 重复 id\n根因：id 取了数组长度\n')
   await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
   await h.write('a.js', 'export const a = 1\n')
   await h.exec('npm test')
   await h.step()
@@ -1061,6 +1407,7 @@ add('S66', 'D2 跨项目：项目 A 交付时复盘原文拷进 ~/.dsh-auto-dev�
   const second = await open({ project: other, sessionId: 'session-s66-b' })
   const b = helpers(second.host, second.state)
   await b.cmd('start 给 notes 加 search', { deliverFollowup: true })
+  await b.register('给 notes 加 search')
   const brief = b.hints.map(row => row.text).join('\n')
   assert.match(brief, /别的项目留下的复盘[\s\S]*project\][\s\S]*rm 后 add 重复 id/, 'B 的开工卡带 A 的最新一条，标项目路径')
   assert.doesNotMatch(brief, /旧的一条/, '每个项目只带最新一条')
@@ -1071,6 +1418,7 @@ add('S65', '交接：另一个会话接手时，接手卡读回任务记录里�
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'console.log("not ok 2 - search milk")\nprocess.exit(1)\n')
   await h.cmd('start 给 notes 加 search 命令', { deliverFollowup: true })
+  await h.register('给 notes 加 search 命令')
   await h.say('搜索不区分大小写')
   await h.write('a.js', 'export const search = () => []\n')
   await h.exec('npm test')
@@ -1097,6 +1445,7 @@ add('S69', '团队约定：~/.dsh-auto-dev/conventions.md（用户自己写）�
   writeFileSync(file, '- 实跑配置一律 rig- 开头，业务名不带前缀\n')
   try {
     await h.cmd('start 给 notes 加 search', { deliverFollowup: true })
+    await h.register('给 notes 加 search')
     const brief = h.hints.map(row => row.text).join('\n')
     assert.match(brief, /团队约定（用户写的原文；跟这个项目自己的约定冲突时，以项目为准）：\n- 实跑配置一律 rig- 开头/)
   } finally { rmSync(file, { force: true }) }
@@ -1108,6 +1457,7 @@ add('S68', '两次运行：项目里已有上次写的复盘，这次原样红�
   mkdirSync(join(h.state.project, '.auto-dev'), { recursive: true })
   writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## rm 后 add 重复 id\n根因：id 取了数组长度\n')
   await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
   for (let i = 0; i < 2; i++) { await h.exec('npm test'); await h.step() }
   const card = h.hints.find(row => /连续第 2 次退出码非 0/.test(row.text))
   assert.ok(card, '第 2 次红出排查卡')
@@ -1137,25 +1487,26 @@ add('S55', 'F-fix（第三条路）：只认一字不差的检查与退出码；
   writeFileSync(join(h.state.project, 'package.json'), JSON.stringify({ scripts: { test: 'node check.mjs' } }))
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(1)\n')
   await h.cmd('start 修一下 add 的重复 id', { deliverFollowup: true })
+  await h.register('修一下 add 的重复 id')
   const brief = h.hints.map(row => row.text).join('\n')
   assert.match(brief, /项目检查是 `npm test`：跑就写 `npm test`；要截短输出就写 `set -o pipefail; npm test/, '开工约定检查写法')
   assert.match(brief, /如果用户要的是紧急止血/, '条件句由模型判断是否适用')
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'f', goal: '修 add' }] })
   await h.exec('npm test')
   await h.step()
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '第 1 次红不说话')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, '第 1 次红不说话')
   // 包了管道的不是项目检查：插件看不见，宁可漏也不猜。
   await h.exec('npm test | tail -3')
   await h.step()
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '管道写法不算')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, '管道写法不算')
   // 临时副本里看新测试红（F-test）：不是项目检查，红两次也不出排查卡（v35 实跑走不到，移到这里验）。
   const copy = mkdtempSync(join(tmpdir(), 'dsh-copy-'))
   writeFileSync(join(copy, 'package.json'), JSON.stringify({ scripts: { test: 'node -e "process.exit(1)"' } }))
   for (let i = 0; i < 2; i++) { await h.exec(`cd ${copy} && npm test`); await h.step() }
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '临时副本的红不算项目检查')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, '临时副本的红不算项目检查')
   await h.exec('npm test')
   await h.step()
-  const fix = h.receipts.filter(row => row.form === 'read-doc')
+  const fix = h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求')
   assert.equal(fix.length, 1)
   assert.equal(fix[0].title, '修 bug · 排查')
   assert.match(fix[0].text, /`npm test` 连续第 2 次退出码非 0/)
@@ -1163,11 +1514,11 @@ add('S55', 'F-fix（第三条路）：只认一字不差的检查与退出码；
   assert.ok(h.receipts.some(row => row.form === 'save' && /修之前/.test(row.line)), '修前存档')
   await h.exec('npm test')
   await h.step()
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 1, '同一段红只出一次')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 1, '同一段红只出一次')
   writeFileSync(join(h.state.project, 'check.mjs'), 'process.exit(0)\n')
   await h.exec('npm test')
   await h.step()
-  const fixed = h.receipts.filter(row => row.form === 'read-doc').at(-1)
+  const fixed = h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').at(-1)
   assert.equal(fixed.title, '修通 · 记一笔')
   assert.match(fixed.text, /红了 3 次之后退出码 0/)
   assert.ok(h.receipts.some(row => row.form === 'save' && /修通/.test(row.line)), '修通存档')
@@ -1186,18 +1537,19 @@ add('S56', '删除 · 还有引用：磁盘上消失的文件仍被引用才出�
   writeFileSync(join(h.state.project, 'cli.js'), "import { load } from './store.js'\nconsole.log(load())\n")
   execFileSync('git', ['add', '-A'], { cwd: h.state.project }); execFileSync('git', ['commit', '-qm', 'base'], { cwd: h.state.project })
   await h.cmd('start 整理存储层', { deliverFollowup: true })
+  await h.register('整理存储层')
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'r', goal: '整理' }] })
   await h.exec('node -e "console.log(\'rm 999\')"')
   await h.exec('npm test')
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '没东西消失就不说话')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title === '删除 · 还有引用').length, 0, '没东西消失就不说话')
   await h.exec('node -e "require(\'fs\').unlinkSync(\'store.js\')"')
   await h.exec('npm test')
-  const card = h.receipts.filter(row => row.form === 'read-doc')
+  const card = h.receipts.filter(row => row.form === 'read-doc' && row.title === '删除 · 还有引用')
   assert.equal(card.length, 1)
   assert.equal(card[0].title, '删除 · 还有引用')
   assert.match(card[0].text, /这些文件里还出现「store」：cli\.js/)
   await h.exec('npm test')
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 1, '同一个文件只说一次')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title === '删除 · 还有引用').length, 1, '同一个文件只说一次')
 }, { git: true })
 
 add('S57', '开工只给条件句和这个项目的原文：复盘与口径逐字带出，不按关键词出方法卡', [], async h => {
@@ -1205,17 +1557,18 @@ add('S57', '开工只给条件句和这个项目的原文：复盘与口径逐�
   writeFileSync(join(h.state.project, '.auto-dev/incidents.md'), '## 导出乱码\n根因：没写 BOM\n')
   writeFileSync(join(h.state.project, '.auto-dev/project-domain.md'), '# 口径\n- 金额一律分为单位\n')
   await h.cmd('start 这个导出很慢，顺便重构一下，再补点测试', { deliverFollowup: true })
+  await h.register('这个导出很慢，顺便重构一下，再补点测试')
   const brief = h.hints.map(row => row.text).join('\n')
   assert.match(brief, /根因：没写 BOM/)
   assert.match(brief, /金额一律分为单位/)
   assert.match(brief, /如果用户要的是紧急止血/)
-  assert.equal(h.receipts.filter(row => row.form === 'read-doc').length, 0, '说慢、说重构都不出关键词卡')
+  assert.equal(h.receipts.filter(row => row.form === 'read-doc' && row.title !== '先理需求').length, 0, '说慢、说重构都不出关键词卡')
   await h.say('先不做了')
   await h.tool('work_control', { operation: 'cancel', reason: '用户说先不做了' })
   assert.equal((await h.board()).task?.state ?? 'cancelled', 'cancelled')
 })
 
-add('S47', 'G2 只认精确词表：删临时目录、删项目目录都不弹授权（存档与删除卡兜底）；git reset --hard 要问，人点的选项算回话', ['blocked-call'], async h => {
+add('S47', 'G2 只认精确词表：删临时目录、删项目目录都不弹授权（存档与删除卡兜底）；git reset --hard 要问，人点「同意」才放行', ['blocked-call'], async h => {
   await h.cmd('start 手动验证 CLI')
   await h.tool('work_start', { request: '手动验证 CLI', mode: 'do', scope: ['.'], acceptance: ['CLI 能跑'] })
   await h.tool('work_plan', { operation: 'set', units: [{ id: 'v1', goal: '验证', scope: ['.'], acceptance: ['能跑'] }] })
@@ -1228,11 +1581,10 @@ add('S47', 'G2 只认精确词表：删临时目录、删项目目录都不弹�
   assert.equal((await h.pre(action)).kind, 'deny', '精确词表里的要先问')
   await h.tool('work_plan', { operation: 'list' })
   assert.match(h.receipts.findLast(row => row.form === 'blocked-call')?.title ?? '', /不可逆/)
-  h.state.log.push({ type: 'tool/call', data: { callId: 'confirm_cmd', name: 'ask_user_question', arguments: {
-    questions: [{ id: 'confirm_cmd', question: `是否允许执行：${action}`, options: [{ label: '允许执行上述命令（推荐）' }, { label: '不执行' }] }] } } })
-  h.state.log.push({ type: 'tool/result', data: { message: { toolCallId: 'confirm_cmd',
-    content: [{ type: 'text', text: JSON.stringify({ answers: [{ id: 'confirm_cmd', selected: ['允许执行上述命令（推荐）'] }] }) }] } } })
-  assert.equal((await h.pre(action)).kind, 'continue', '点过「允许」之后放行')
+  await h.pick(CONSENT_NO)
+  assert.equal((await h.pre(action)).kind, 'deny', '点了「不同意」照拦')
+  await h.pick(CONSENT_YES)
+  assert.equal((await h.pre(action)).kind, 'continue', '点了「同意」之后放行')
 })
 
 for (const scenario of scenarios) {
@@ -1325,6 +1677,16 @@ if (teaching.length) {
   for (const row of teaching) console.log(`  ${row.id} ${row.summary}：${row.fills.join('、')}`)
 }
 
+// ——— 卡面编号闸 ———
+// What a person reads on a card never names an internal id (用户 2026-11-04: 右侧面板给非技术人用).
+const FACE_ID = /\bu\d+\b|\btask-[a-z0-9]+-[a-z0-9]+\b|\bproposal-[a-z0-9]+|\bdaily\b/
+const faceIds = rows.flatMap(row => (row.receipts ?? []).map(card => ({ id: row.id, face: [card.title, card.line, card.tag, ...(card.warnings ?? [])].filter(Boolean).join(' · ') })))
+  .filter(row => FACE_ID.test(row.face))
+if (faceIds.length) {
+  console.log('\n卡面露出内部编号 → 给人看的地方用「第 N 步」、任务名：')
+  for (const row of faceIds) console.log(`  ${row.id} ${row.face}`)
+}
+
 // ——— 覆盖闸门 ———
 // The bench is the only thing that sees the products of the control plane, so a
 // path that exists in the code and not here is a path nobody checks. The lists
@@ -1379,4 +1741,4 @@ console.log(`覆盖：${counts.forms[0]}/${counts.forms[1]} form · ${counts.ver
   + `${counts.tools[0]}/${counts.tools[1]} 工具 · `
   + `${counts.operations[0]}/${counts.operations[1]} 分支 · `
   + `${counts.panel[0]}/${counts.panel[1]} 面板字段${coverageBad ? '（有缺口）' : ''}`)
-process.exit(bad.length || coverageBad || (!only && teaching.length) ? 1 : 0)
+process.exit(bad.length || coverageBad || (!only && (teaching.length || faceIds.length)) ? 1 : 0)

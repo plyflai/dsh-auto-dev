@@ -153,8 +153,19 @@ test('a plan rewrite keeps the progress notes already on a unit', () => {
 test('a plan written as steps, tasks or items is the same plan (v27: steps emptied it silently)', () => {
   for (const key of ['steps', 'tasks', 'items']) {
     const { units } = digestUnits({ [key]: [{ id: 'u1', title: '过滤' }, { id: 'u2', text: 'rm 报错', [key === 'steps' ? 'subtasks' : 'steps']: [{ goal: '子项' }] }] })
-    assert.deepEqual(units.map(row => row.id), ['u1', 'u2', 'u3'], key)
+    assert.deepEqual(units.map(row => row.id), ['u1', 'u2', 'u2.1'], key)
     assert.equal(units[0].goal, '过滤')
     assert.equal(units[2].parent, 'u2')
   }
+})
+
+test('an unnamed step never takes an id the model wrote, and stays under its own parent (v56 clarify)', () => {
+  const { units } = digestUnits([
+    { id: 'u1', goal: '加 --limit', steps: ['重写 listed()', '补测试'] },
+    { id: 'u2', goal: '更新 usage' },
+    { id: 'u3', goal: '跑检查', steps: ['npm test'] },
+  ])
+  assert.deepEqual(units.map(row => [row.id, row.parent ?? null]), [
+    ['u1', null], ['u1.1', 'u1'], ['u1.2', 'u1'], ['u2', null], ['u3', null], ['u3.1', 'u3']])
+  assert.equal(units.filter(row => row.id === 'u3').length, 1, 'the model\'s u3 keeps its id')
 })

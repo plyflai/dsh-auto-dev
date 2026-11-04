@@ -40,11 +40,11 @@ Vibe coding makes fast fashion: use it once, throw it away. dsh-auto-dev ships p
 
 ### 7. Requirement clarification: it asks before it guesses
 - **Vibe coding:** starts on a one-liner, builds the wrong thing.
-- **dsh-auto-dev:** when a request has several parts or anything vague, it restates what it understood before touching code, explains any cheaper alternative, and asks the one question that matters most; it decides technical details itself.
+- **dsh-auto-dev:** it reads the code before touching anything and registers the task only once the request is clear. If something is vague it restates what it understood, explains any better approach, and asks the one question that matters most; technical details it decides itself. Turn on **autopilot** and it never waits: it picks the best approach, does the work, and lists every decision it made without you at hand-in.
 
 ### 8. Rolling Git checkpoints: save before every boss fight
 - **Vibe coding:** one slip and your code is gone.
-- **dsh-auto-dev:** saves before a fix and after it passes; roll back anytime. Hard resets, force-pushes, publishing and deploys always ask you first.
+- **dsh-auto-dev:** saves when you start, before a fix and after it passes; roll back anytime. Hard resets, force-pushes, publishing and deploys always need you to click yes first — even on autopilot.
 
 ## Install
 
@@ -64,6 +64,12 @@ In any chat, start with `/dsh-auto-dev` and say what you want:
 ```
 
 That's it. Planning, coding, testing and delivery are on it; when a decision is yours, it stops and asks.
+
+Away from the keyboard? Start it on autopilot:
+
+```
+/dsh-auto-dev start --auto add a search command to the notes CLI.
+```
 
 Continuing tomorrow in a new chat:
 
@@ -85,12 +91,13 @@ Chats that never use `/dsh-auto-dev` are left completely alone.
 
 | Command | |
 | --- | --- |
-| `start <request>` | Start work, or pick up this project's unfinished task |
+| `start <request>` | Start work, or pick up this project's unfinished task (`start --auto <request>` starts on autopilot) |
 | `new <request>` | Always open a new task |
 | `status` | Current task, progress, what is pending |
 | `tasks` | Recent tasks in this project |
 | `adopt [taskId]` | Continue a task from another chat |
 | `pause` · `resume` · `cancel` | Change the task's state |
+| `auto on` · `auto off` | Autopilot for this task: on, it never waits for you and lists its unconfirmed decisions at hand-in; irreversible steps are still left to you |
 | `organize` | Propose a cleanup of a long plan; nothing changes until you agree |
 | `plan` · `help` | How to begin |
 
@@ -120,11 +127,11 @@ Experience across projects lives in `~/.dsh-auto-dev/`:
 ## Checkpoints and rollback
 
 - Checkpoints are Git-based (under `refs/dsh-auto-dev/`) and never move your HEAD, branch or index. Each task keeps its latest 5; the repository keeps the saves of the latest 3 tasks, the rest is left to `git gc`.
-- Rollback restores Git-tracked files only, and every rollback needs your explicit OK. Untracked files, databases and running services are not covered.
+- Rollback restores Git-tracked files only, and every rollback needs your click. Untracked files, databases and running services are not covered.
 - Only four gates ever stop the model; everything else is a reminder:
   - **Honest delivery**: no passing project check after the last change — the plugin runs it itself and refuses only if it is red;
-  - **Destructive commands**: `git reset --hard`, `git clean -f`, force-push, `branch -D`, `stash drop`, any `publish`, terraform / kubectl / helm, `vercel --prod`, `fly deploy`, `gh release create` run only with your OK this time;
-  - **Your bans**: a place you said not to touch is refused;
+  - **Destructive commands**: `git reset --hard`, `git clean -f`, force-push, `branch -D`, `stash drop`, any `publish`, terraform / kubectl / helm, `vercel --prod`, `fly deploy`, `gh release create` run only after you click yes — on DSH's own approval card when the session asks for approvals, otherwise on a two-option question card. Typed words are never read as a yes; on autopilot these steps are skipped and listed for you;
+  - **Your bans**: a place you said not to touch is refused; lifting a ban takes the same click;
   - **Postmortem on disk**: a bug was fixed but `incidents.md` did not change — the hand-in is refused once.
 - Commands outside that list, such as `rm -rf` or SQL, are not stopped; checkpoints and the "deleted · still referenced" card are the safety net.
 
@@ -134,7 +141,7 @@ In chats that opted in, the model gets seven tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `work_start` | Register a task (already done for you when you start with the command; every argument is optional) |
+| `work_start` | Register the task once the request is clear, in the model's own restatement (your words and replies are kept beside it; if the model edits files first, the plugin registers your words for it) |
 | `work_plan` | Optional units, dependencies and grouping |
 | `work_submit` | Hand in a result tied to real executions from this session |
 | `work_status` | Read the task, its executions and the board |

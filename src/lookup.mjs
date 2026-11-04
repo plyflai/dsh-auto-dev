@@ -7,6 +7,8 @@
  * is the per-session `taskId` cache.
  */
 
+import { shownGoal, themeState } from './tools/shared.mjs'
+
 /**
  * Newest first, as a comparator over one table. Two writes in the same millisecond
  * share an `updatedAt`, and the table order then decided which task a person got:
@@ -148,7 +150,9 @@ export function createLookup({ records, sessionState, sessionId }) {
     const boundId = currentId
     return rows.map(task => {
       const plan = task.planId ? records.peekOne('plans', task.planId) : undefined
-      const units = Array.isArray(plan?.units) ? plan.units : []
+      // The 日需 bucket is bookkeeping, not a theme a person made: it is not a row, not a parent, not counted.
+      const units = (Array.isArray(plan?.units) ? plan.units : []).filter(unit => unit?.id !== 'daily' && unit?.role !== 'daily')
+        .map(unit => (unit.parent === 'daily' ? { ...unit, parent: undefined } : unit))
       const themes = new Set(units.filter(unit => typeof unit?.parent === 'string' && unit.parent !== '').map(unit => unit.parent))
       return {
         id: task.id,
@@ -163,7 +167,9 @@ export function createLookup({ records, sessionState, sessionId }) {
         // One line per unit is all an expanded past row shows; the goal text is the
         // same sentence the board would print, so nothing is reworded for history.
         units: units.map(unit => ({
-          id: unit.id, goal: unit.goal, state: unit.state ?? 'pending',
+          // A theme's state is derived from its steps, the same rule the board uses (v58 timeline ○ over ✓✓).
+          id: unit.id, goal: shownGoal(units, unit),
+          state: units.some(row => row.parent === unit.id) ? themeState(units.filter(row => row.parent === unit.id), unit.state) : unit.state ?? 'pending',
           ...(unit.parent ? { parent: unit.parent } : {}),
           ...(unit.deliverable ? { deliverable: unit.deliverable } : {}),
         })),

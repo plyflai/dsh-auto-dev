@@ -84,8 +84,17 @@ export function registerHooks(ctx, api) {
   // then lost a 10 KB `write` at step 24 with no correction left to give.)
   const corrected = new Set()
   const correctedAt = new Map()
+  // Why a save did not happen, in the person's words; each from a git call the plugin made itself.
+  const unsaved = saved => {
+    if (saved?.reason === 'only untracked files changed') {
+      const files = saved.untracked ?? []
+      return `：没存上——已跟踪的文件跟上次提交一样；新建、还没加进 git 的 ${files.length} 个文件不进存档（${files.slice(0, 3).join('、')}${files.length > 3 ? ' …' : ''}）`
+    }
+    const words = { 'no writes since the last commit': '工作区跟上次提交一样，没有可存的', 'not a git repository': '这里不是 git 仓库', 'no commits yet': '仓库还没有提交', 'checkpoints are disabled in the dsh-auto-dev settings': '设置里关了存档' }
+    return `：没存上（${words[saved?.reason] ?? saved?.reason ?? '未知原因'}）`
+  }
   const saveNotice = (unit, line, saved, tone = 'neutral') => api.notice(
-    `**存档** — ${line}${saved?.ref ? `（${saved.ref}）` : `：没存上（${saved?.reason ?? '未知原因'}）`}`,
+    `**存档** — ${line}${saved?.ref ? `（${saved.ref}）` : unsaved(saved)}`,
     'dsh-auto-dev save',
     { form: 'save', data: { unit: unit?.id ?? '', title: '存档', line, tag: saved?.ref ? `#${saved.seq}` : '未存档', tone } })
   // The fix flow's two moments, from the project's own check and nothing else:
@@ -568,14 +577,21 @@ export function registerHooks(ctx, api) {
   // 收尾. A turn that ends on the model's own words, with the project on disk
   // different from when the task started, is a hand-in: the plugin settles it,
   // so delivery never waits on the model remembering a tool. G1/G4 still decide;
-  // a refusal goes on once per tree, a second stop on the same tree ends the turn.
-  // A turn that ends on a question is waiting on the person, not handing in.
+  // A refusal here is written into the conversation for the person and the next
+  // turn, never steered back: the plugin cannot tell a turn that is done from one
+  // waiting on the person (v69 test #122 asked A/B/C without a question mark; a
+  // steered G1 pushed the model to pick C for the user). Not delivered stays true.
+  // Into the conversation now, without waking the model; a host without that write gets it on the next step.
+  const writeDown = (agent, message) => {
+    if (typeof agent.session?.append === 'function') agent.session.append('user/message', message, { surfaceOp: 'append' })
+    else api.queueReceipt(agent, message)
+  }
   const settleAtStop = async (agent, turn) => {
     const task = api.activeTask(agent)
     if (!task || task.state !== 'active') return null
     const last = lastAssistant(agent.session, turn)
     const text = String(last?.text ?? '').trim()
-    if (!text || last.callNames?.length || /[？?]\s*$/.test(text)) return null
+    if (!text || last.callNames?.length) return null
     const start = await startOf(task)
     const now = start && await fingerprint(task.project)
     if (!now || now.id === start.id) return null
@@ -601,14 +617,15 @@ export function registerHooks(ctx, api) {
       // turn. Written into the conversation now, without waking the model, so the
       // person sees 已交付 where the turn ended. A host without that write gets
       // them on the next step.
-      for (const message of api.takeOutbox(agent)) {
-        if (typeof agent.session?.append === 'function') agent.session.append('user/message', message, { surfaceOp: 'append' })
-        else api.queueReceipt(agent, message)
-      }
+      for (const message of api.takeOutbox(agent)) writeDown(agent, message)
       return null
     } catch (error) {
       if (!(error instanceof GateError)) return null
-      return api.notice(`dsh-auto-dev ${GATES[error.gate]}：${error.message}`, 'dsh-auto-dev 收尾', { form: 'notice' })
+      // The person sees the gate's own capsule; the model reads the full line on its next turn.
+      for (const message of api.takeOutbox(agent)) writeDown(agent, message)
+      writeDown(agent, api.notice(`dsh-auto-dev ${GATES[error.gate]}：${error.message}（回合结束时插件试着交付，没算交付；任务还开着）`,
+        'dsh-auto-dev 收尾', { form: 'notice' }))
+      return null
     }
   }
 

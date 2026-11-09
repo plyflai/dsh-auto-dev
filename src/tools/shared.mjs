@@ -62,6 +62,7 @@ export const CRAFT_MODES = Object.freeze({
   'references/craft/review.md': '自查',
   'references/craft/bdd.md': '场景',
   'references/craft/interview.md': '澄清',
+  'references/craft/decompose.md': '拆需求',
   'references/craft/perf.md': '性能',
 })
 

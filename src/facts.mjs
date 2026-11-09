@@ -116,7 +116,8 @@ export function recentIncidents(project, count = 3, max = 1600) {
   try { text = readFileSync(join(project, INCIDENTS_FILE), 'utf8') } catch { return '' }
   const sections = sectionsOf(text)
   const picked = sections.length ? sections.slice(-count).join('\n').trim() : tailOf(text, 30)
-  return picked.length > max ? picked.slice(-max) : picked
+  // Cut from the front, and said: a card must not read a clipped entry as whole.
+  return picked.length > max ? `…（前面截掉了，全文见 ${INCIDENTS_FILE}）\n${picked.slice(-max)}` : picked
 }
 
 /** Keep the newest MAX_INCIDENTS entries; returns how many were dropped. */

@@ -4,6 +4,6 @@
  * words (设计约定「绝对禁忌」); the tool descriptions own the parameters. Shared by
  * the replay report and the scenario bench, so a live run and the bench judge alike.
  */
-export const FILLS = /operation:\s*\w+|\bwork_(start|plan|control|submit|extend|env|status)\b|\b(kind|scope|acceptance|claims|callId|target):|\b(preserve|residue|outcome)\b/g
+export const FILLS = /operation:\s*\w+|\bwork_(start|plan|control|submit|extend|env|status|recall)\b|\b(kind|scope|acceptance|claims|callId|target):|\b(preserve|residue|outcome)\b/g
 
 export const fillsIn = text => [...new Set(String(text ?? '').match(FILLS) ?? [])]

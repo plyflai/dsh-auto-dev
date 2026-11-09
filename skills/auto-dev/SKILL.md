@@ -1,11 +1,11 @@
 ---
 name: auto-dev-craft
-description: Practical methods for Auto Dev delivery, debugging, impact analysis, verification, UI, review, release and project knowledge. Read the relevant guide when its situation occurs; depth follows the task.
+description: Development craft for Auto Dev tasks - how to verify, test, debug, measure performance, judge impact, refactor without changing behaviour, cut deliverables, decompose a request, interview a non-technical owner, write behaviour scenarios, do UI acceptance, review and release. Load when a task changes code and needs judgement beyond running commands; read only the guide for the situation at hand.
 ---
 
 # Auto Dev 工艺索引
 
-开发任务默认用 `do`，计划按需要建立。`look` 表示查看意图；历史 `build` 按 `do` 执行。人工验收 `pm` 与自动验收 `auto` 独立于模式。
+登记时除了你复述的要求，其余都可不填，插件从仓库补；只看不改的任务可以标成查看（`look`），默认是交付（`do`）。计划按需要建立。
 
 ## 入口与产出
 
@@ -24,11 +24,15 @@ description: Practical methods for Auto Dev delivery, debugging, impact analysis
 | 当前问题 | 方法 |
 | --- | --- |
 | 如何证明结果 | [验证](references/craft/verification.md) |
+| 补测试、写回归用例 | [测试](references/craft/test.md) |
 | 界面与真实交互 | [界面](references/craft/gui.md) |
 | 失败与根因 | [排障](references/craft/debug.md) |
+| 慢、卡、延迟、内存 | [性能](references/craft/perf.md) |
 | 调用方与改动范围 | [影响分析](references/craft/impact.md) |
+| 重构、提取、改名，行为不变 | [重构](references/craft/refactor.md) |
 | 改多少、要不要新抽象 | [实现取舍](references/craft/simplicity.md) |
 | 交付切分 | [交付](references/craft/delivery.md) |
+| 开工前拆需求（O 与分步） | [需求拆解](references/craft/decompose.md) |
 | 影响实现的歧义 | [访谈](references/craft/interview.md) |
 | 用户行为与业务规则 | [行为场景](references/craft/bdd.md) |
 | 自审或独立审查 | [审查](references/craft/review.md) |
@@ -36,6 +40,6 @@ description: Practical methods for Auto Dev delivery, debugging, impact analysis
 | 可复用知识与交接 | [记忆](references/craft/memory.md) |
 | 语言或平台做法 | [patterns 索引](references/patterns/README.md)，以实际内容为准 |
 
-代码负责校验、权限与持久化；方法提示提供当前可执行动作。只读有用的部分，不登记阅读。具体输入以七工具 schema 为准。记录不是确认，提示不是完成，历史执行不是本会话证明。
+代码负责校验、权限与持久化；方法提示提供当前可执行动作。只读有用的部分，不登记阅读。具体输入以八工具 schema 为准。记录不是确认，提示不是完成，历史执行不是本会话证明。
 
 宿主负责多代理与工作树。本插件没有独立调度器，也不宣称 patterns 会自动学习。

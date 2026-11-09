@@ -94,7 +94,7 @@ test('apply registers six tools, a settings section, a projection, a command and
   assert.equal(name, 'dsh-auto-dev')
 
   const names = stub.tools.map(tool => tool.name).sort()
-  assert.deepEqual(names, ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_start', 'work_status', 'work_submit'])
+  assert.deepEqual(names, ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_recall', 'work_start', 'work_status', 'work_submit'])
   for (const tool of stub.tools) {
     assert.equal(tool.parameters.type, 'object')
     assert.equal(typeof tool.execute, 'function')
@@ -1093,7 +1093,7 @@ test('work_start is not even offered until the user starts, and one start grants
   const answered = await stub.commands[0].handler({ agent, rawInput: 'start 把登录按钮改成进度条' })
   assert.equal(answered.kind, 'success')
   assert.equal(turns.length, 1, 'the grant and the turn come from the same user gesture')
-  assert.deepEqual(stub.tools.map(tool => tool.name).sort(), ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_start', 'work_status', 'work_submit'])
+  assert.deepEqual(stub.tools.map(tool => tool.name).sort(), ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_recall', 'work_start', 'work_status', 'work_submit'])
 
   // Drive the command's actual followup: the model must see registration as the
   // next action, not a request to make the person repeat the command.
@@ -1401,13 +1401,13 @@ test('opting in is a record: a reloaded host gives the session its tools back', 
   assert.ok(created, 'the session must be told apart when it is announced, not guessed at chat time')
   created({ agent: { id: 'agent-r', session: { id: 'session-keep' } } })
   assert.deepEqual(reloaded.tools.map(tool => tool.name).sort(),
-    ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_start', 'work_status', 'work_submit'])
+    ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_recall', 'work_start', 'work_status', 'work_submit'])
   created({ agent: { id: 'agent-o', session: { id: 'session-other' } } })
-  assert.equal(reloaded.tools.length, 7, 'a different conversation stays dormant')
+  assert.equal(reloaded.tools.length, 8, 'a different conversation stays dormant')
 
   // Announcing the same session again does not stack a second set on top of it.
   created({ agent: { id: 'agent-r2', session: { id: 'session-keep' } } })
-  assert.equal(reloaded.tools.length, 7)
+  assert.equal(reloaded.tools.length, 8)
 })
 
 test('a task already running when this build arrives keeps its conversation enabled', async () => {
@@ -2092,7 +2092,7 @@ test('a session already open when the plugin loads gets its tools on the first a
   stub.ctx.get = service => (service === 'agents' ? { list: () => [agent] } : undefined)
   await apply(stub.ctx, {})
   assert.deepEqual(own.map(tool => tool.name).sort(),
-    ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_start', 'work_status', 'work_submit'])
+    ['work_control', 'work_env', 'work_extend', 'work_plan', 'work_recall', 'work_start', 'work_status', 'work_submit'])
   // Opted out stays opted out: a session with no row is not handed the tools.
   const stranger = { ...agent, id: 'agent-other', session: { ...agent.session, id: 'session-other', header: { id: 'session-other' } }, ctx: { tools: { register: definition => { own.push(definition); return () => {} } } } }
   const before = own.length

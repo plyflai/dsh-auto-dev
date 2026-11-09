@@ -89,6 +89,10 @@ export const workSubmit = api => (
     const runs = checkRuns(window.results, verifier)
     // What the model declared (mode, acceptanceMode) is shown, never what decides a gate (v54 look tasks skipped G1).
     const handIn = verdict.outcome === 'complete'
+    // G1/G4 guard the hand-in of the whole task, not a step: a step marked done mid-plan is
+    // recorded and the gates wait for the last one (v64: 「写测试、确认红」 marked done was refused for its own red).
+    const remainingBefore = plan ? leafUnits(plan.units).filter(row => row.id !== unit?.id && row.state !== 'done' && !(row.state === 'dropped' && approvedReduction(task, plan, row))) : []
+    const wholeTask = handIn && (settling || remainingBefore.length === 0)
     // G3 on disk: a file the person ruled out changed since the task started,
     // whichever tool did it. Paths from two fingerprints, never shell text.
     const banned = handIn ? await g3(task) : undefined
@@ -103,7 +107,7 @@ export const workSubmit = api => (
     const moved = !start || nowPrint?.id !== start.id
     // Whether the disk moved, when both trees can be read; undefined outside git.
     const changed = start && nowPrint ? nowPrint.id !== start.id : undefined
-    const ran = handIn && moved ? await g1(api, task, exec.agent, verifier) : undefined
+    const ran = wholeTask && moved ? await g1(api, task, exec.agent, verifier) : undefined
     const red = ran?.red
     if (ran?.green) runs.push(ran.green)
     // G1 skipped because the plugin's own green already covers this tree: that green is a run too,
@@ -116,14 +120,14 @@ export const workSubmit = api => (
       refused(`交付前插件跑了 ${verifier.command}，没通过 — 修好再交`)
       throw new GateError('G1', `交付前插件在项目里跑了 \`${verifier.command}\`，没通过。输出末尾：\n${red}\n这是插件跑的检查，不是用户的新要求：如果用户同意过留着这条红，停下告诉他，别为过门去改他不让动的地方`, '修好让它通过，再交')
     }
-    const fix = handIn ? g4(task, runs) : undefined
+    const fix = wholeTask ? g4(task, runs) : undefined
     if (fix) {
       refused(`修通过一次，${INCIDENTS_FILE} 还没写 — 写完再交`)
       throw new GateError('G4', `\`${fix.green.command}\` 红了 ${fix.reds.length} 次后转绿，${INCIDENTS_FILE} 没有变化`,
         `把这次写进 ${INCIDENTS_FILE}：症状、试过的方向、根因、修法、验证命令；红是有意的就写一行「有意的红」`)
     }
     // The project's postmortems go to the team's place too (D2), trimmed first.
-    if (handIn) { trimIncidents(task.project); shareIncidents(task.project) }
+    if (wholeTask) { trimIncidents(task.project); shareIncidents(task.project) }
     // The same doubts as `warnings`, in the words the person reads on the receipt
     // and the board; `warnings` stays the model's instruction.
     const reminders = []

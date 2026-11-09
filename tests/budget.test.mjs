@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import { stubHost } from '../tools/flow.mjs'
 import { apply } from '../src/index.js'
 
-const TOOL_BUDGET = 7
+const TOOL_BUDGET = 8 // +work_recall (2026-11-09): the start brief lists incident titles instead of carrying old entries verbatim
 const DESCRIPTION_BUDGET = 6600 // characters; retained historical ceiling, not a token-efficiency measurement
 
 test('the resident surface stays inside its budget', async () => {

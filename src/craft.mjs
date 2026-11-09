@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 /**
  * Everything the plugin says to the model, and when (设计约定「第三条路」).
  *
@@ -22,6 +23,7 @@ import { DOMAIN_FILE } from './domain.mjs'
 import { changedPaths, changedSinceStored, fingerprint, marksOf, startOf } from './disk.mjs'
 import { spokeSinceStart } from './decisions.mjs'
 import { teamConventions, teamIncidents } from './team.mjs'
+import { incidentIndex } from './incidents.mjs'
 import { noticeSaid } from './said.mjs'
 import { stepName } from './tools/shared.mjs'
 
@@ -58,12 +60,27 @@ export const autopilotCard = on => [on
  * yet, and registering is what this card asks for once the request is clear (v43:
  * registered at start and told 「直接开工」, the model never asked).
  */
+// The methods ship with the plugin, not the project: the model gets the absolute path to read
+// (v62 decompose: the skill tool did not know auto-dev-craft, and a relative path sent it searching the disk).
+const CRAFT_DIR = fileURLToPath(new URL('../skills/auto-dev/', import.meta.url))
+const craftDoc = doc => join(CRAFT_DIR, doc)
+const DECOMPOSE = `先读 ${craftDoc('references/craft/decompose.md')}（需求拆解，插件自带的方法），`
+
+// What the person confirms is what the tests check: an acceptance written as inputs and outputs
+// is already the test list (2026-11-09: tests were written after the code, never from the acceptance).
+const ACCEPTANCE_IO = '验收写成看得见的输入 → 输出，至少一条正常的、一条边界或非法的（例：`<命令或操作>` → `<应该看到什么>`）；拿不准的业务口径放进要用户拍板的问题。'
+const TEST_FIRST = `如果这次要改程序的行为（修 bug、加功能）：先把验收里每条输入 → 输出写成测试，照项目现有测试的写法，跑一次项目检查看它们红，再改代码让它变绿。哪些用例自己补、哪些先问用户，见 ${craftDoc('references/craft/test.md')}。`
+
 export function clarifyCard(words, auto = false) {
   const method = auto
-    ? '自动驾驶开着：用户不会回话。先只读看代码，登记前不改不删；用更专业的话复述成要求和验收，写清你怎么理解、选了哪个做法和为什么，直接登记开工；有含糊或有更好的做法，按你判断的最佳做法走，交付时把这些决定列出来让用户确认。'
-    : '先弄清要什么再动手：登记前只读，不改不删；需求清楚，就用更专业的话复述成要求和验收，登记后开工；'
-      + '有含糊处，先把复述发给用户确认（第一行写「**我理解的要求：**」，逐条列要求和验收），只问一个最影响下一步的问题，然后结束这一回合等他回。'
-      + '定下来后看一眼相关部分：有明显更好的做法，先讲清差别问他用不用；他说用，就把新做法登记成要求。'
+    ? '自动驾驶开着：用户不会回话。先只读看代码，登记前不改不删；小需求用更专业的话复述成要求和验收；'
+      + `${ACCEPTANCE_IO}`
+      + `需求偏产品层、牵涉多处或要选做法，${DECOMPOSE}拆成 O（目标）和 KR（分步）写出来。`
+      + '写清你怎么理解、选了哪个做法和为什么，直接登记开工；有含糊或有更好的做法，按你判断的最佳做法走，交付时把这些决定列出来让用户确认。'
+    : '先弄清要什么再动手：登记前只读，不改不删。小需求（一两句说得清、改动集中、没什么可取舍）不用拆，用更专业的话复述成要求和验收；'
+      + `${ACCEPTANCE_IO}`
+      + `需求偏产品层、牵涉多处或要选做法，${DECOMPOSE}拆成 O（目标，补上更好的做法和用户可能没想到的点）和 KR（分步，全部做完 O 就成），要他拍板的最多 3 个。`
+      + '两种都先在回复正文里写给用户看（第一行写「**我理解的要求：**」，拆的要把 O 和每个分步写出来；问题卡代替不了这段），然后结束这一回合等他说行；他说行，再把目标和验收登记成要求、分步登记成分步，开工。'
   return [`用户用 /dsh-auto-dev start 说了要做的事，原话逐字：「${words}」\n${method}`,
     'dsh-auto-dev start granted', { form: 'read-doc', data: { title: '先理需求', line: oneLine(words), tag: auto ? '自动驾驶' : '开工', tone: 'info' } }]
 }
@@ -122,12 +139,47 @@ const domainText = (project, max = 1600) => {
   } catch { return '' }
 }
 
+// Up to this many entries the start brief carries them all verbatim; past it, the newest
+// verbatim and every title, so the model chooses what to open (2026-11-09: 复盘成了知识库).
+const VERBATIM = 3
+
+/** This project's incidents for a brief: all verbatim when few, else the newest plus every title. */
+const incidentsLine = project => {
+  const { here } = incidentIndex(project)
+  if (!here.length) return ''
+  if (here.length <= VERBATIM) return `${INCIDENTS_FILE} 最近几条（原文）：\n${recentIncidents(project, VERBATIM)}`
+  return `${INCIDENTS_FILE} 共 ${here.length} 条复盘。最新一条（原文）：\n${recentIncidents(project, 1)}\n全部标题（新→旧）：\n${here.map(title => `- ${title}`).join('\n')}`
+}
+
+// At most this many older titles per other project, and in all (the newest of each is shown verbatim).
+const TEAM_TITLES = 5
+const TEAM_TITLES_MAX = 20
+
+/**
+ * Titles other projects left beyond what the card already shows verbatim (the newest entry
+ * of the first `shown` projects), newest project first. A list cut short says how many it
+ * left out and where the rest is — counted by the plugin, never left to read as complete
+ * (v67 rig-cross-project: 4 of 5 titles, the one that mattered missing, no count).
+ */
+const teamTitles = (project, shown) => {
+  let left = TEAM_TITLES_MAX
+  const rows = incidentIndex(project).team.map((row, index) => {
+    const titles = index < shown ? row.titles.slice(1) : row.titles
+    const listed = titles.slice(0, Math.max(0, Math.min(TEAM_TITLES, left)))
+    left -= listed.length
+    const hidden = titles.length - listed.length
+    return { ...row, listed, hidden }
+  }).filter(row => row.listed.length || row.hidden)
+  if (!rows.length) return ''
+  const line = row => `[${row.project}] ${row.listed.join('；')}${row.hidden ? `${row.listed.length ? '；' : ''}另有 ${row.hidden} 条更早的没列出（全文在 ${row.path}）` : ''}`
+  return `\n别的项目更早的复盘标题：\n${rows.map(line).join('\n')}`
+}
+
 /**
  * The start brief's lines after the person's words: the plain-check agreement,
  * the conditional sentences, and this project's incidents and domain verbatim.
  */
 export function startLines(project, verifier) {
-  const incidents = recentIncidents(project, 3)
   const domain = domainText(project)
   const team = teamIncidents(project, 3)
   const conventions = teamConventions()
@@ -135,11 +187,12 @@ export function startLines(project, verifier) {
     verifier?.command
       ? `项目检查是 \`${verifier.command}\`：${checkAgreement(verifier.command)}`
       : '',
+    TEST_FIRST,
     ...START,
-    incidents ? `${INCIDENTS_FILE} 最近几条（原文）：\n${incidents}` : '',
+    incidentsLine(project),
     domain ? `${DOMAIN_FILE}（原文）：\n${domain}` : '',
     conventions ? `团队约定（用户写的原文；跟这个项目自己的约定冲突时，以项目为准）：\n${conventions}` : '',
-    team.length ? `别的项目留下的复盘（各项目最新一条原文；跟这次像就参考，不像就忽略）：\n${team.map(row => `[${row.project}]\n${row.text}`).join('\n')}` : '',
+    team.length ? `别的项目留下的复盘（各项目最新一条原文；跟这次像就参考，不像就忽略）：\n${team.map(row => `[${row.project}]\n${row.text}`).join('\n')}${teamTitles(project, team.length)}` : '',
   ].filter(Boolean)
 }
 
@@ -197,10 +250,10 @@ export const CARDS = Object.freeze({
     line: '先列 2–4 个最可能的方向，按可能性排序，从最可能的开始逐个用最便宜的办法证实或排除，排除了记一句再试下一个；可回「修前」档。如果这些红是你有意写的测试，忽略这张。',
   },
   fixed: {
-    doc: 'references/craft/debug.md',
+    doc: 'references/craft/memory.md',
     title: '修通 · 记一笔',
     brief: `红过之后转绿：写进 ${INCIDENTS_FILE}`,
-    line: `如果刚修好的是个 bug，把症状、试过的方向（哪些排除了、为什么）、根因、修法、验证命令写进 ${INCIDENTS_FILE}，格式不限。如果这些红是有意的，在那里写一行「有意的红」。`,
+    line: `如果刚修好的是个 bug，在 ${INCIDENTS_FILE} 末尾加一条：第一行 \`## \` 开头，一句话说清这条经验落了什么，让以后的人只看标题就知道要不要点开（例：\`## 删除后再加 id 重复：id 用 length+1，改成 max+1\`）；下面写症状、试过的方向（哪些排除了、为什么）、根因、修法、验证命令。如果这些红是有意的，写一行 \`## 有意的红：<哪个测试>\`。`,
   },
   deleted: {
     doc: 'references/craft/impact.md',
@@ -213,7 +266,7 @@ export const CARDS = Object.freeze({
 /** `[body, summary, options]` for api.notice / api.queueNotice. */
 export function craftCard(key, { unit, facts = [] } = {}) {
   const page = CARDS[key]
-  const body = [...facts.filter(Boolean).map(line => `事实：${line}`), `方法：${page.line}`, `参考：${page.doc}`].join('\n')
+  const body = [...facts.filter(Boolean).map(line => `事实：${line}`), `方法：${page.line}`, `参考：${craftDoc(page.doc)}`].join('\n')
   return [body, `dsh-auto-dev method ${key}`, { form: 'read-doc', data: { unit: unit?.id ?? '', title: page.title, line: page.brief, tag: page.doc, tone: 'info' } }]
 }
 
@@ -222,7 +275,7 @@ export const fixCard = (unit, reds, project) => craftCard('fix', {
   unit,
   facts: [
     `\`${reds.at(-1).command}\` 连续第 ${reds.length} 次退出码非 0，最后一次输出末尾：\n${tailOf(reds.at(-1).output, 20)}`,
-    recentIncidents(project, 3) ? `${INCIDENTS_FILE} 最近几条（原文）：\n${recentIncidents(project, 3)}` : '',
+    incidentsLine(project),
   ],
 })
 

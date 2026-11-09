@@ -82,7 +82,16 @@ export async function captureCheckpoint(project, { slug, tag, seq, commit: kept 
   if (!head.ok) return { ok: false, skipped: 'no commits yet' }
   const created = kept ? { ok: true, out: kept } : await git(project, ['stash', 'create'], { allowFailure: true })
   if (!created.ok) return { ok: false, skipped: `checkpoint failed: ${created.reason}` }
-  if (created.out === '') return { ok: false, skipped: 'no writes since the last commit' }
+  if (created.out === '') {
+    // stash create leaves untracked files out: say so instead of "nothing written" (v68 feature #140,
+    // the first writes were a new test file). Listing them is the plugin's own git call; they are not
+    // swallowed into the object store (大原则 8).
+    const others = await git(project, ['ls-files', '--others', '--exclude-standard'], { allowFailure: true })
+    const untracked = others.ok ? others.out.split('\n').map(line => line.trim()).filter(Boolean) : []
+    return untracked.length
+      ? { ok: false, skipped: 'only untracked files changed', untracked }
+      : { ok: false, skipped: 'no writes since the last commit' }
+  }
   const commit = created.out
   const ref = `refs/dsh-auto-dev/${slug}/${seq}-${tag}`
   const written = await git(project, ['update-ref', ref, commit], { allowFailure: true })

@@ -1,5 +1,5 @@
 /**
- * The seven tools the model sees, and the host registration loop around them.
+ * The eight tools the model sees, and the host registration loop around them.
  *
  * These descriptions are the only resident knowledge this package has: they sit in
  * every request, unlike the craft manuals behind the skill provider. Keeping them
@@ -16,9 +16,10 @@ import { workStatus } from './tools/status.mjs'
 import { workControl } from './tools/control.mjs'
 import { workExtend } from './tools/extend.mjs'
 import { workEnv } from './tools/env.mjs'
+import { workRecall } from './tools/recall.mjs'
 
 /** The tool table, in the order the model sees it. One file per tool under `tools/`. */
-export const WORK_TOOLS = [workStart, workPlan, workSubmit, workStatus, workControl, workExtend, workEnv]
+export const WORK_TOOLS = [workStart, workPlan, workSubmit, workStatus, workControl, workExtend, workEnv, workRecall]
 
 /** Release a set of registrations, newest first, without letting one failure strand the rest. */
 export function releaseAll(disposers) {
@@ -28,7 +29,7 @@ export function releaseAll(disposers) {
 }
 
 /**
- * Install the seven `work_*` tools into one scope.
+ * Install the eight `work_*` tools into one scope.
  *
  * The scope decides who can see them: the agent's own context registers for that
  * conversation alone, the plugin context for the whole host. Auto Dev is
@@ -55,7 +56,7 @@ export function installWorkTools(scope, api) {
         // state — the caller sees "value is not lossless JSON" and the work looks
         // like it never happened. Strip non-representable values at the boundary.
         execute: async (args, exec) => lossless({ ...await execute(args, exec), ...(toolName === 'work_control' ? { reference: 'references/operations.md' } : {}) }),
-        ...(['work_status'].includes(toolName) ? { isConcurrencySafe: () => true } : {}),
+        ...(['work_status', 'work_recall'].includes(toolName) ? { isConcurrencySafe: () => true } : {}),
       }))
     }
   } catch (error) {

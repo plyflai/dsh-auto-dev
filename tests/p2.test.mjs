@@ -136,10 +136,10 @@ test('P2 status owners agree on grouped leaves, waiting and legacy return shapes
   assert.match(JSON.stringify(command), /1\/2/)
 })
 
-test('P2 public schemas expose ask and goal while seven tools remain discoverable', async () => {
+test('P2 public schemas expose ask and goal while eight tools remain discoverable', async () => {
   const h = await harness()
   await h.start({ mode: 'look' })
-  assert.equal(h.host.tools.size, 7)
+  assert.equal(h.host.tools.size, 8)
   assert.ok(h.host.tools.get('work_plan').parameters.properties.operation.enum.includes('ask'))
   assert.ok(h.host.tools.get('work_control').parameters.properties.operation.enum.includes('goal'))
   for (const tool of h.host.tools.values()) {

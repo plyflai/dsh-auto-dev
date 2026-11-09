@@ -1,6 +1,6 @@
 import { decisionSource } from '../decisions.mjs'
 import { text } from '../task.mjs'
-import { nextUnit, unitsIn } from '../plan.mjs'
+import { flattenUnits, nextUnit, unitsInCall } from '../plan.mjs'
 import { workSubmit } from './submit.mjs'
 import { string, containersOf, childrenOf, STEP_WORD, DAILY_UNIT, withDaily, dailyWarning, groupUnder, stepName } from './shared.mjs'
 
@@ -21,7 +21,7 @@ export const workPlan = api => (
     const task = api.requireTask(api.activeTask(exec.agent) ?? api.latestTask(exec.agent), args.taskId)
     if (!task) return api.noTask(exec.agent)
     const operation = ['set', 'add', 'group', 'organize', 'activate', 'state', 'list', 'note', 'ask'].includes(args.operation)
-      ? args.operation : unitsIn(args) ? 'set' : args.state ? 'state' : args.text && args.unit ? 'note' : 'list'
+      ? args.operation : unitsInCall(args, ['members']) ? 'set' : args.state ? 'state' : args.text && args.unit ? 'note' : 'list'
     // Reading a closed task's plan is useful; changing it is not: the units of a
     // finished task must not be re-opened behind the owner's back. It is an answer, not a refusal.
     if (['closed', 'cancelled', 'review_ready'].includes(task.state) && operation !== 'list') {
@@ -119,7 +119,9 @@ export const workPlan = api => (
     if (operation === 'set' || operation === 'add') {
       const before = new Set(containersOf(api.planOf(task)?.units ?? []).map(unit => unit.id))
       // Whatever key the units came under; organize's `steps` are not units, but organize never gets here.
-      const given = unitsIn(args)
+      const given = unitsInCall(args, ['members'])
+      // Nothing readable as a unit: say what the plan has instead of writing it empty (v66 #69).
+      if (!flattenUnits(given ?? []).length) return existing(operation === 'set' ? '这次没读出任何单元，计划没动' : '这次没读出要加的单元，计划没动')
       const incoming = operation === 'set'
         ? given
         : [...(api.planOf(task)?.units ?? []), ...(Array.isArray(given) ? given : [])]
@@ -221,7 +223,7 @@ export const workPlan = api => (
         tellUser: '顺手给用户一句：现在开始哪个单元、为什么。工具调用不算对用户说话。',
       }
     }
-    // Done is a hand-in, so it goes through the one place that can say no (G1). A milestone
+    // Done goes through work_submit: the gates (G1/G4) only speak when it hands in the whole task. A milestone
     // marked done is every open leaf under it done, one card each (v52: only the first leaf closed).
     if (args.state === 'done') {
       const under = id => plan.units.filter(row => row.parent === id).flatMap(row => plan.units.some(kid => kid.parent === row.id) ? under(row.id) : [row])

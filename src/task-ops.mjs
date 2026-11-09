@@ -54,7 +54,7 @@ export function createTaskOps({ records, settings, sessionState, sessionId, seq,
     const at = new Date().toISOString()
     if (!captured.ok) {
       await records.change('tasks', task.id, current => ({ ...current, checkpointSkipped: captured.skipped, updatedAt: at }))
-      return { snapshot: 'skipped', reason: captured.skipped }
+      return { snapshot: 'skipped', reason: captured.skipped, ...(captured.untracked ? { untracked: captured.untracked } : {}) }
     }
     // A checkpoint is a pair around something demonstrable, or a background copy
     // that rotates. The labels ride on the record so the panel can name the pair

@@ -40,7 +40,7 @@ Vibe coding makes fast fashion: use it once, throw it away. dsh-auto-dev ships p
 
 ### 7. Requirement clarification: it asks before it guesses
 - **Vibe coding:** starts on a one-liner, builds the wrong thing.
-- **dsh-auto-dev:** it reads the code before touching anything and registers the task only once the request is clear. If something is vague it restates what it understood, explains any better approach, and asks the one question that matters most; technical details it decides itself. Turn on **autopilot** and it never waits: it picks the best approach, does the work, and lists every decision it made without you at hand-in.
+- **dsh-auto-dev:** it reads the code before touching anything and registers the task only once the request is clear. Small requests it restates as requirements; product-level or multi-part ones it first breaks down into one professional objective (O — with better approaches and the unknowns you may not have considered) and a few steps (KRs), shows you that plus anything you need to decide, and starts only once you say go; technical details it decides itself. Turn on **autopilot** and it never waits: it picks the best approach, does the work, and lists every decision it made without you at hand-in.
 
 ### 8. Rolling Git checkpoints: save before every boss fight
 - **Vibe coding:** one slip and your code is gone.
@@ -137,7 +137,7 @@ Experience across projects lives in `~/.dsh-auto-dev/`:
 
 ## For developers
 
-In chats that opted in, the model gets seven tools:
+In chats that opted in, the model gets eight tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -148,6 +148,7 @@ In chats that opted in, the model gets seven tools:
 | `work_control` | Pause, accept, rework, hand off, checkpoints, notes |
 | `work_extend` | For things that need your OK: tells the model what to ask you (it never grants anything itself) |
 | `work_env` | Facts about the environment, with their source |
+| `work_recall` | Postmortem knowledge base: list every incident title (this project and others), or search entries by words |
 
 The engineering playbook lives in [skills/auto-dev](skills/auto-dev/SKILL.md).
 

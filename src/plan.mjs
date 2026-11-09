@@ -42,11 +42,17 @@ function goalOf(unit) {
  * as often as `units`; an unread spelling silently emptied the plan (v27 #46).
  */
 const UNIT_KEYS = ['units', 'steps', 'tasks', 'items', 'subtasks']
+// Any other key holding a list of things with a goal is a plan too (v66 rig-cross-project: `plan: [...]`
+// emptied a two-step plan). Shape is digested, not refused (大原则 2).
+const goalList = list => Array.isArray(list) && list.length > 0 && list.every(entry => typeof entry === 'string' || (entry && typeof entry === 'object' && !Array.isArray(entry) && goalOf(entry)))
 export const unitsIn = value => {
   if (Array.isArray(value) || typeof value === 'string') return value
   const key = UNIT_KEYS.find(name => Array.isArray(value?.[name]) || (name === 'units' && typeof value?.[name] === 'string'))
   return key ? value[key] : undefined
 }
+/** A tool call's units under whatever key it used: a known spelling first, else any list of goals. Only for call arguments — a stored row's own lists (notes) are not plans. */
+export const unitsInCall = (args, skip = []) => unitsIn(args) ?? Object.entries(args ?? {})
+  .find(([name, list]) => !skip.includes(name) && goalList(list) && list.some(entry => typeof entry === 'object'))?.[1]
 
 const declaredId = unit => {
   const raw = typeof unit?.id === 'number' ? String(unit.id) : unit?.id

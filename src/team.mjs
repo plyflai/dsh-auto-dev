@@ -60,6 +60,25 @@ export function shareIncidents(project) {
   } catch { return '' }
 }
 
+/** Every other project's team copy, newest project first: `[{ project, text }]` (the copy minus its header line). */
+export function teamFiles(project) {
+  const dir = teamDir()
+  if (!existsSync(dir)) return []
+  const own = `${slugOf(project)}.md`
+  let files = []
+  try {
+    files = readdirSync(dir).filter(name => name.endsWith('.md') && name !== own)
+      .map(name => ({ path: join(dir, name), at: statSync(join(dir, name)).mtimeMs }))
+      .sort((a, b) => b.at - a.at)
+  } catch { return [] }
+  return files.flatMap(file => {
+    let text = ''
+    try { text = readFileSync(file.path, 'utf8') } catch { return [] }
+    const from = text.startsWith(HEAD) ? text.slice(HEAD.length, text.indexOf(' -->')) : file.path
+    return [{ project: from, path: file.path, text: text.startsWith(HEAD) ? text.slice(text.indexOf('\n') + 1) : text }]
+  })
+}
+
 /**
  * The newest entries other projects left, verbatim, newest project first:
  * `[{ project, text }]`, at most `count` entries in all and `max` characters each.
@@ -85,3 +104,4 @@ export function teamIncidents(project, count = 3, max = 800) {
   }
   return out
 }
+

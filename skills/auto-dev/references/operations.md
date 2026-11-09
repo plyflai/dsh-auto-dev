@@ -1,6 +1,6 @@
 # 操作索引
 
-七工具名称不变。常用输入由工具 schema 提供；这里补充低频操作和兼容边界。
+八工具名称不变（另加只读的 `work_recall`）。常用输入由工具 schema 提供；这里补充低频操作和兼容边界。
 
 ## 计划与阶段结果
 
@@ -38,7 +38,7 @@
 
 ## 项目知识
 
-复盘写 `.auto-dev/incidents.md`、业务口径写 `.auto-dev/project-domain.md`，用普通编辑工具即可；`remember` 仍可用，但不是必需。
+复盘写 `.auto-dev/incidents.md`（每条 `## 标题` 开头，`work_recall` 按标题列、按词搜，含别的项目的）、业务口径写 `.auto-dev/project-domain.md`，用普通编辑工具即可；`remember` 仍可用，但不是必需。
 
 运行端口、命令、GUI、禁令属于 `work_env`。`observe` 只接受成功当前执行的 `callId` 或真实用户 `quote/sourceSeq`。推断用 `propose`。受保护规则的确认和撤销必须有明确用户来源；通用授权不能覆盖禁令。
 
